@@ -1,0 +1,167 @@
+cabal-version: 2.2
+
+-- This file has been generated from package.yaml by hpack version 0.39.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           khronos-vulkan-tutorial-haskell
+version:        0.1.0.0
+synopsis:       Haskell reimplementation of the Khronos Vulkan Tutorial
+description:    Please see the README on GitHub at <https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell#readme>
+category:       Graphics
+homepage:       https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell#readme
+bug-reports:    https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell/issues
+author:         Heitor Toledo Lassarote de Paula
+maintainer:     heitortoledo at hotmail dot com
+copyright:      2026 Heitor Toledo Lassarote de Paula
+license:        BSD-3-Clause
+license-file:   LICENSE
+build-type:     Simple
+extra-source-files:
+    README.md
+    CHANGELOG.md
+
+source-repository head
+  type: git
+  location: https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell
+
+library
+  exposed-modules:
+      Tutorial.Vulkan.HelloTriangle
+  other-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  autogen-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  hs-source-dirs:
+      src
+  default-extensions:
+      BlockArguments
+      DataKinds
+      DeriveAnyClass
+      DerivingStrategies
+      DuplicateRecordFields
+      GeneralizedNewtypeDeriving
+      ImportQualifiedPost
+      LambdaCase
+      MultiParamTypeClasses
+      NamedFieldPuns
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+      PatternSynonyms
+      RecordWildCards
+      ScopedTypeVariables
+      StandaloneKindSignatures
+      StrictData
+      TypeApplications
+      TypeData
+      TypeFamilies
+      ViewPatterns
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  c-sources:
+      cbits/debug_callback.c
+  build-depends:
+      GLFW-b
+    , base >=4.7 && <5
+    , bytestring
+    , monad-loops
+    , mtl
+    , resourcet
+    , transformers
+    , unliftio
+    , vector
+    , vulkan
+  default-language: Haskell2010
+
+executable khronos-vulkan-tutorial-haskell-exe
+  main-is: Main.hs
+  other-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  autogen-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  hs-source-dirs:
+      app
+  default-extensions:
+      BlockArguments
+      DataKinds
+      DeriveAnyClass
+      DerivingStrategies
+      DuplicateRecordFields
+      GeneralizedNewtypeDeriving
+      ImportQualifiedPost
+      LambdaCase
+      MultiParamTypeClasses
+      NamedFieldPuns
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+      PatternSynonyms
+      RecordWildCards
+      ScopedTypeVariables
+      StandaloneKindSignatures
+      StrictData
+      TypeApplications
+      TypeData
+      TypeFamilies
+      ViewPatterns
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      GLFW-b
+    , base >=4.7 && <5
+    , bytestring
+    , khronos-vulkan-tutorial-haskell
+    , monad-loops
+    , mtl
+    , resourcet
+    , transformers
+    , unliftio
+    , vector
+    , vulkan
+  default-language: Haskell2010
+
+test-suite khronos-vulkan-tutorial-haskell-test
+  type: exitcode-stdio-1.0
+  main-is: Spec.hs
+  other-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  autogen-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  hs-source-dirs:
+      test
+  default-extensions:
+      BlockArguments
+      DataKinds
+      DeriveAnyClass
+      DerivingStrategies
+      DuplicateRecordFields
+      GeneralizedNewtypeDeriving
+      ImportQualifiedPost
+      LambdaCase
+      MultiParamTypeClasses
+      NamedFieldPuns
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+      PatternSynonyms
+      RecordWildCards
+      ScopedTypeVariables
+      StandaloneKindSignatures
+      StrictData
+      TypeApplications
+      TypeData
+      TypeFamilies
+      ViewPatterns
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      GLFW-b
+    , base >=4.7 && <5
+    , bytestring
+    , khronos-vulkan-tutorial-haskell
+    , monad-loops
+    , mtl
+    , resourcet
+    , transformers
+    , unliftio
+    , vector
+    , vulkan
+  default-language: Haskell2010

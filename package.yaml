@@ -1,0 +1,94 @@
+name:                khronos-vulkan-tutorial-haskell
+version:             0.1.0.0
+github:              "heitor-lassarote/khronos-vulkan-tutorial-haskell"
+license:             BSD-3-Clause
+author:              "Heitor Toledo Lassarote de Paula"
+maintainer:          "heitortoledo at hotmail dot com"
+copyright:           "2026 Heitor Toledo Lassarote de Paula"
+
+extra-source-files:
+- README.md
+- CHANGELOG.md
+
+# Metadata used when publishing your package
+synopsis:            Haskell reimplementation of the Khronos Vulkan Tutorial
+category:            Graphics
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- bytestring
+- GLFW-b
+- monad-loops
+- mtl
+- resourcet
+- transformers
+- unliftio
+- vector
+- vulkan
+
+default-extensions:
+- BlockArguments
+- DataKinds
+- DeriveAnyClass
+- DerivingStrategies
+- DuplicateRecordFields
+- GeneralizedNewtypeDeriving
+- ImportQualifiedPost
+- LambdaCase
+- MultiParamTypeClasses
+- NamedFieldPuns
+- NoFieldSelectors
+- OverloadedRecordDot
+- OverloadedStrings
+- PatternSynonyms
+- RecordWildCards
+- ScopedTypeVariables
+- StandaloneKindSignatures
+- StrictData
+- TypeApplications
+- TypeData
+- TypeFamilies
+- ViewPatterns
+
+ghc-options:
+- -Wall
+- -Wcompat
+- -Widentities
+- -Wincomplete-record-updates
+- -Wincomplete-uni-patterns
+- -Wmissing-export-lists
+- -Wmissing-home-modules
+- -Wpartial-fields
+- -Wredundant-constraints
+
+library:
+  source-dirs: src
+  c-sources:
+  - cbits/debug_callback.c
+
+executables:
+  khronos-vulkan-tutorial-haskell-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - khronos-vulkan-tutorial-haskell
+
+tests:
+  khronos-vulkan-tutorial-haskell-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - khronos-vulkan-tutorial-haskell
