@@ -5,7 +5,7 @@ module Tutorial.Vulkan.HelloTriangle (
 import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Loops (whileM_)
-import Control.Monad.Reader (MonadReader (..), ReaderT (..), asks)
+import Control.Monad.Reader (MonadReader (..), ReaderT (..))
 import Control.Monad.Trans.Resource (MonadResource, ReleaseKey, ResIO, allocate, allocate_, release, runResourceT)
 import Data.Bits (shift, zeroBits, (.&.), (.|.))
 import Data.ByteString.Char8 (ByteString)
@@ -22,6 +22,7 @@ import System.FilePath ((<.>), (</>))
 import System.IO (hPutStrLn, stderr)
 import UnliftIO.Exception (Exception (displayException), SomeException, assert, catch, throwIO)
 import UnliftIO.Foreign (Storable (..), alloca, nullPtr, peekCString)
+import UnliftIO.IORef (newIORef, readIORef, writeIORef)
 import Vulkan qualified as Vk
 import Vulkan.CStruct.Extends (SomeStruct (..), pattern (:&))
 import Vulkan.Zero (zero)
@@ -29,19 +30,25 @@ import Vulkan.Zero (zero)
 foreign import ccall unsafe "debug_callback.c &debug_callback"
   debugCallbackPtr :: Vk.PFN_vkDebugUtilsMessengerCallbackEXT
 
+type Frame :: Type
+data Frame = Frame
+  { presentCompleteSemaphore :: Vk.Semaphore
+  , inFlightFence :: Vk.Fence
+  , commandBuffer :: Vk.CommandBuffer
+  }
+
 type Application :: Type
 data Application = Application
   { window :: GLFW.Window
   , width, height :: Int
+  , frames :: Vector Frame
   , device :: Vk.Device
   , queue :: Vk.Queue
   , swapChain :: Vk.SwapchainKHR
   , swapChainImages :: Vector Vk.Image
   , swapChainExtent :: Vk.Extent2D
   , swapChainImageViews :: Vector Vk.ImageView
-  , presentCompleteSemaphore, renderFinishedSemaphore :: Vk.Semaphore
-  , drawFence :: Vk.Fence
-  , commandBuffer :: Vk.CommandBuffer
+  , renderFinishedSemaphores :: Vector Vk.Semaphore
   , graphicsPipeline :: Vk.Pipeline
   }
 
@@ -75,6 +82,9 @@ withResultCheck msg action = do
 defaultWidth, defaultHeight :: Int
 defaultWidth = 800
 defaultHeight = 600
+
+maxFramesInFlight :: Int
+maxFramesInFlight = 2
 
 initWindow :: Int -> Int -> ResIO GLFW.Window
 initWindow width height = do
@@ -535,24 +545,37 @@ createCommandPool device queueIndex = do
       (Vk.createCommandPool device poolInfo Nothing)
       (flip (Vk.destroyCommandPool device) Nothing)
 
-createSyncObjects :: Vk.Device -> ResIO (Vk.Semaphore, Vk.Semaphore, Vk.Fence)
-createSyncObjects device = do
+createSyncObjects ::
+  Vk.Device -> Vector Vk.Image -> ResIO (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
+createSyncObjects device swapChainImages = do
   -- Signal that an image has been acquired from the swapchain and is ready for rendering
-  (_presentCompleteSemaphoreReleaseKey, presentCompleteSemaphore) <-
-    allocate
-      (Vk.createSemaphore device zero Nothing)
-      (flip (Vk.destroySemaphore device) Nothing)
+  presentCompleteSemaphores <-
+    Vector.replicateM
+      maxFramesInFlight
+      ( snd
+          <$> allocate
+            (Vk.createSemaphore device zero Nothing)
+            (flip (Vk.destroySemaphore device) Nothing)
+      )
   -- Signal that rendering has finished and presentation can happen
-  (_renderFinishedSemaphoreReleaseKey, renderFinishedSemaphore) <-
-    allocate
-      (Vk.createSemaphore device zero Nothing)
-      (flip (Vk.destroySemaphore device) Nothing)
+  renderFinishedSemaphores <-
+    Vector.replicateM
+      (Vector.length swapChainImages)
+      ( snd
+          <$> allocate
+            (Vk.createSemaphore device zero Nothing)
+            (flip (Vk.destroySemaphore device) Nothing)
+      )
   -- Ensure only one frame is rendered at a time
-  (_drawFenceReleaseKey, drawFence) <-
-    allocate
-      (Vk.createFence device zero{Vk.flags = Vk.FENCE_CREATE_SIGNALED_BIT} Nothing)
-      (flip (Vk.destroyFence device) Nothing)
-  pure (presentCompleteSemaphore, renderFinishedSemaphore, drawFence)
+  inFlightFences <-
+    Vector.replicateM
+      maxFramesInFlight
+      ( snd
+          <$> allocate
+            (Vk.createFence device zero{Vk.flags = Vk.FENCE_CREATE_SIGNALED_BIT} Nothing)
+            (flip (Vk.destroyFence device) Nothing)
+      )
+  pure (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences)
 
 initVulkan :: Bool -> Int -> Int -> ResIO Application
 initVulkan enableValidationLayers width height = do
@@ -567,34 +590,42 @@ initVulkan enableValidationLayers width height = do
   swapChainImageViews <- createImageViews swapChainSurfaceFormat swapChainImages device
   graphicsPipeline <- createGraphicsPipeline device swapChainExtent swapChainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
-  commandBuffer <- createCommandBuffer device commandPool
-  (presentCompleteSemaphore, renderFinishedSemaphore, drawFence) <- createSyncObjects device
+  commandBuffers <- createCommandBuffers device commandPool
+  (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
+    createSyncObjects device swapChainImages
+  let
+    frames =
+      Vector.zipWith3
+        (\presentCompleteSemaphore inFlightFence commandBuffer -> Frame{..})
+        presentCompleteSemaphores
+        inFlightFences
+        commandBuffers
   pure Application{..}
 
-createCommandBuffer :: Vk.Device -> Vk.CommandPool -> ResIO Vk.CommandBuffer
-createCommandBuffer device commandPool = do
+createCommandBuffers :: Vk.Device -> Vk.CommandPool -> ResIO (Vector Vk.CommandBuffer)
+createCommandBuffers device commandPool = do
   let
     allocInfo =
       (zero :: Vk.CommandBufferAllocateInfo)
         { Vk.commandPool
         , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
-        , Vk.commandBufferCount = 1
+        , Vk.commandBufferCount = fromIntegral maxFramesInFlight
         }
-  Vector.head . snd
+  snd
     <$> allocate
       (Vk.allocateCommandBuffers device allocInfo)
       (Vk.freeCommandBuffers device commandPool)
 
-recordCommandBuffer :: Word32 -> MonadApplication ()
-recordCommandBuffer imageIndex = do
+recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
+recordCommandBuffer imageIndex frame = do
   Application
-    { commandBuffer
-    , swapChainImageViews
+    { swapChainImageViews
     , swapChainExtent
     , graphicsPipeline
     } <-
     ask
-  Vk.beginCommandBuffer commandBuffer zero
+
+  Vk.beginCommandBuffer frame.commandBuffer zero
 
   transitionImageLayout
     imageIndex
@@ -604,6 +635,7 @@ recordCommandBuffer imageIndex = do
     Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+    frame
   let
     clearColor = Vk.Color $ Vk.Float32 0 0 0 1
     attachmentInfo =
@@ -621,19 +653,19 @@ recordCommandBuffer imageIndex = do
         , Vk.colorAttachments = Vector.singleton attachmentInfo
         }
 
-  Vk.cmdBeginRendering commandBuffer renderingInfo
+  Vk.cmdBeginRendering frame.commandBuffer renderingInfo
 
-  Vk.cmdBindPipeline commandBuffer Vk.PIPELINE_BIND_POINT_GRAPHICS graphicsPipeline
+  Vk.cmdBindPipeline frame.commandBuffer Vk.PIPELINE_BIND_POINT_GRAPHICS graphicsPipeline
   Vk.cmdSetViewport
-    commandBuffer
+    frame.commandBuffer
     0
     ( Vector.singleton $
         Vk.Viewport 0 0 (fromIntegral swapChainExtent.width) (fromIntegral swapChainExtent.height) 0 1
     )
-  Vk.cmdSetScissor commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapChainExtent))
-  Vk.cmdDraw commandBuffer 3 1 0 0
+  Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapChainExtent))
+  Vk.cmdDraw frame.commandBuffer 3 1 0 0
 
-  Vk.cmdEndRendering commandBuffer
+  Vk.cmdEndRendering frame.commandBuffer
 
   transitionImageLayout
     imageIndex
@@ -643,8 +675,9 @@ recordCommandBuffer imageIndex = do
     zero
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     Vk.PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT
+    frame
 
-  Vk.endCommandBuffer commandBuffer
+  Vk.endCommandBuffer frame.commandBuffer
 
 transitionImageLayout ::
   Word32 ->
@@ -654,6 +687,7 @@ transitionImageLayout ::
   Vk.AccessFlags2 ->
   Vk.PipelineStageFlags2 ->
   Vk.PipelineStageFlags2 ->
+  Frame ->
   MonadApplication ()
 transitionImageLayout
   imageIndex
@@ -662,8 +696,9 @@ transitionImageLayout
   srcAccessMask
   dstAccessMask
   srcStageMask
-  dstStageMask = do
-    Application{commandBuffer, swapChainImages} <- ask
+  dstStageMask
+  frame = do
+    Application{swapChainImages} <- ask
     let
       barrier =
         (zero :: Vk.ImageMemoryBarrier2 '[])
@@ -690,35 +725,37 @@ transitionImageLayout
           { Vk.dependencyFlags = zero
           , Vk.imageMemoryBarriers = Vector.singleton $ SomeStruct barrier
           }
-    Vk.cmdPipelineBarrier2 commandBuffer dependencyInfo
+    Vk.cmdPipelineBarrier2 frame.commandBuffer dependencyInfo
 
-drawFrame :: MonadApplication ()
-drawFrame = do
+drawFrame :: Int -> MonadApplication ()
+drawFrame frameIndex = do
   Application{..} <- ask
-  let drawFences = Vector.singleton drawFence
+  let frame = frames Vector.! frameIndex
+  let drawFences = Vector.singleton frame.inFlightFence
   Vk.waitForFences device drawFences True maxBound
     >>= checkResult "Failed to wait for fence!"
   Vk.resetFences device drawFences
 
   (_imageIndexResult, imageIndex) <-
-    Vk.acquireNextImageKHR device swapChain maxBound presentCompleteSemaphore zero
-  recordCommandBuffer imageIndex
+    Vk.acquireNextImageKHR device swapChain maxBound frame.presentCompleteSemaphore zero
+  recordCommandBuffer imageIndex frame
 
   let
     waitDestinationStageMask = Vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+    renderFinishedSemaphore = Vector.singleton $ renderFinishedSemaphores Vector.! fromIntegral imageIndex
     submitInfo =
       (zero :: Vk.SubmitInfo '[])
-        { Vk.waitSemaphores = Vector.singleton presentCompleteSemaphore
+        { Vk.waitSemaphores = Vector.singleton frame.presentCompleteSemaphore
         , Vk.waitDstStageMask = Vector.singleton waitDestinationStageMask
-        , Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle commandBuffer
-        , Vk.signalSemaphores = Vector.singleton renderFinishedSemaphore
+        , Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle $ frame.commandBuffer
+        , Vk.signalSemaphores = renderFinishedSemaphore
         }
-  Vk.queueSubmit queue (Vector.singleton $ SomeStruct submitInfo) drawFence
+  Vk.queueSubmit queue (Vector.singleton $ SomeStruct submitInfo) frame.inFlightFence
 
   let
     presentInfoKHR =
       (zero :: Vk.PresentInfoKHR '[])
-        { Vk.waitSemaphores = Vector.singleton renderFinishedSemaphore
+        { Vk.waitSemaphores = renderFinishedSemaphore
         , Vk.swapchains = Vector.singleton swapChain
         , Vk.imageIndices = Vector.singleton imageIndex
         }
@@ -730,9 +767,12 @@ drawFrame = do
 mainLoop :: MonadApplication ()
 mainLoop = do
   Application{window, device} <- ask
+  frameIndexRef <- newIORef 0
   whileM_ (liftIO $ fmap not $ GLFW.windowShouldClose window) do
+    frameIndex <- readIORef frameIndexRef
     liftIO GLFW.pollEvents
-    drawFrame
+    drawFrame frameIndex
+    writeIORef frameIndexRef $ (frameIndex + 1) `mod` maxFramesInFlight
 
   Vk.deviceWaitIdle device
 
