@@ -18,6 +18,7 @@ import Data.Vector (Vector)
 import Data.Vector qualified as Vector
 import Data.Word (Word32)
 import Graphics.UI.GLFW qualified as GLFW
+import System.FilePath ((<.>), (</>))
 import System.IO (hPutStrLn, stderr)
 import UnliftIO.Exception (Exception (displayException), SomeException, assert, catch, throwIO)
 import UnliftIO.Foreign (Storable (..), alloca, nullPtr, peekCString)
@@ -35,6 +36,7 @@ data Application = Application
   , glfwKey, windowKey, instanceKey, deviceKey, surfaceKey, swapChainKey :: ReleaseKey
   , debugMessengerKeyMb :: Maybe ReleaseKey
   , swapChainImageViewsKeys :: Vector ReleaseKey
+  , graphicsPipelineKey, pipelineLayoutKey :: ReleaseKey
   }
 
 type MonadApplication :: Type -> Type
@@ -176,7 +178,10 @@ pickPhysicalDevice inst = do
     properties <- Vk.getPhysicalDeviceProperties physicalDevice
     features <-
       Vk.getPhysicalDeviceFeatures2
-        @'[Vk.PhysicalDeviceVulkan13Features, Vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT]
+        @'[ Vk.PhysicalDeviceVulkan11Features
+          , Vk.PhysicalDeviceVulkan13Features
+          , Vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT
+          ]
         physicalDevice
     queueFamilies <- Vk.getPhysicalDeviceQueueFamilyProperties physicalDevice
 
@@ -197,9 +202,11 @@ pickPhysicalDevice inst = do
                   availableDeviceExtensions
           )
           requiredDeviceExtensions
-      (physicalDeviceVulkan13Features, (physicalDeviceExtendedDynamicStateFeatures, ())) = features.next
+      (physicalDeviceVulkan11Features, (physicalDeviceVulkan13Features, (physicalDeviceExtendedDynamicStateFeatures, ()))) = features.next
       supportsRequiredFeatures =
-        physicalDeviceVulkan13Features.dynamicRendering && physicalDeviceExtendedDynamicStateFeatures.extendedDynamicState
+        physicalDeviceVulkan11Features.shaderDrawParameters
+          && physicalDeviceVulkan13Features.dynamicRendering
+          && physicalDeviceExtendedDynamicStateFeatures.extendedDynamicState
 
     pure $ supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures
 
@@ -248,6 +255,7 @@ createLogicalDevice physicalDevice surface = do
         }
     featureChain =
       (zero :: Vk.PhysicalDeviceFeatures2 '[])
+        :& (zero :: Vk.PhysicalDeviceVulkan11Features){Vk.shaderDrawParameters = True}
         :& (zero :: Vk.PhysicalDeviceVulkan13Features){Vk.dynamicRendering = True}
         :& (zero :: Vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT){Vk.extendedDynamicState = True}
         :& ()
@@ -319,7 +327,7 @@ createSwapChain ::
   Vk.PhysicalDevice ->
   Vk.SurfaceKHR ->
   GLFW.Window ->
-  ResIO (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image)
+  ResIO (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
 createSwapChain device physicalDevice surface window = do
   surfaceCapabilities <- Vk.getPhysicalDeviceSurfaceCapabilitiesKHR physicalDevice surface
   swapChainExtent <- chooseSwapExtent surfaceCapabilities window
@@ -355,7 +363,7 @@ createSwapChain device physicalDevice surface window = do
   swapChainImages <-
     withResultCheck "Failed to get swapchain images" $
       Vk.getSwapchainImagesKHR device swapChain
-  pure (swapChainReleaseKey, swapChain, swapChainSurfaceFormat, swapChainImages)
+  pure (swapChainReleaseKey, swapChain, swapChainSurfaceFormat, swapChainImages, swapChainExtent)
 
 createImageViews ::
   Vk.SurfaceFormatKHR ->
@@ -380,14 +388,124 @@ createImageViews swapChainSurfaceFormat swapChainImages device = do
   traverse
     ( \image ->
         allocate
-          ( Vk.createImageView
-              device
-              imageViewCreateInfo{Vk.image}
-              Nothing
-          )
+          (Vk.createImageView device imageViewCreateInfo{Vk.image} Nothing)
           (flip (Vk.destroyImageView device) Nothing)
     )
     swapChainImages
+
+createShaderModule :: Vk.Device -> ByteString -> ResIO (ReleaseKey, Vk.ShaderModule)
+createShaderModule device code = do
+  let createInfo = (zero :: Vk.ShaderModuleCreateInfo '[]){Vk.code}
+  allocate
+    (Vk.createShaderModule device createInfo Nothing)
+    (flip (Vk.destroyShaderModule device) Nothing)
+
+createGraphicsPipeline ::
+  Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR -> ResIO (ReleaseKey, Vk.Pipeline, ReleaseKey)
+createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
+  shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
+  (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
+  let
+    vertShaderStageInfo =
+      (zero :: Vk.PipelineShaderStageCreateInfo '[])
+        { Vk.stage = Vk.SHADER_STAGE_VERTEX_BIT
+        , Vk.module' = shaderModule
+        , Vk.name = "vertMain"
+        }
+    fragShaderStageInfo =
+      (zero :: Vk.PipelineShaderStageCreateInfo '[])
+        { Vk.stage = Vk.SHADER_STAGE_FRAGMENT_BIT
+        , Vk.module' = shaderModule
+        , Vk.name = "fragMain"
+        }
+    shaderStages = Vector.fromList [vertShaderStageInfo, fragShaderStageInfo]
+
+    dynamicStates = Vector.fromList [Vk.DYNAMIC_STATE_VIEWPORT, Vk.DYNAMIC_STATE_SCISSOR]
+    dynamicState = (zero :: Vk.PipelineDynamicStateCreateInfo){Vk.dynamicStates}
+
+    vertexInputInfo = zero :: Vk.PipelineVertexInputStateCreateInfo '[]
+    inputAssemblyState =
+      (zero :: Vk.PipelineInputAssemblyStateCreateInfo)
+        { Vk.topology = Vk.PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+        }
+
+    viewportState =
+      (zero :: Vk.PipelineViewportStateCreateInfo '[])
+        { Vk.viewportCount = 1
+        , Vk.scissorCount = 1
+        }
+
+    rasterizer =
+      (zero :: Vk.PipelineRasterizationStateCreateInfo '[])
+        { Vk.depthClampEnable = False
+        , Vk.rasterizerDiscardEnable = False
+        , Vk.polygonMode = Vk.POLYGON_MODE_FILL
+        , Vk.cullMode = Vk.CULL_MODE_BACK_BIT
+        , Vk.frontFace = Vk.FRONT_FACE_CLOCKWISE
+        , Vk.depthBiasEnable = False
+        , Vk.lineWidth = 1
+        }
+    multisampling =
+      (zero :: Vk.PipelineMultisampleStateCreateInfo '[])
+        { Vk.rasterizationSamples = Vk.SAMPLE_COUNT_1_BIT
+        , Vk.sampleShadingEnable = False
+        }
+    colorBlendAttachment =
+      (zero :: Vk.PipelineColorBlendAttachmentState)
+        { Vk.blendEnable = False
+        , Vk.colorWriteMask =
+            Vk.COLOR_COMPONENT_R_BIT
+              .|. Vk.COLOR_COMPONENT_G_BIT
+              .|. Vk.COLOR_COMPONENT_B_BIT
+              .|. Vk.COLOR_COMPONENT_A_BIT
+        }
+    colorBlending =
+      (zero :: Vk.PipelineColorBlendStateCreateInfo '[])
+        { Vk.logicOpEnable = False
+        , Vk.logicOp = Vk.LOGIC_OP_COPY
+        , Vk.attachmentCount = 1
+        , Vk.attachments = Vector.singleton colorBlendAttachment
+        }
+
+    pipelineLayoutInfo = zero :: Vk.PipelineLayoutCreateInfo
+  (pipelineLayoutReleaseKey, pipelineLayout) <-
+    allocate
+      (Vk.createPipelineLayout device pipelineLayoutInfo Nothing)
+      (flip (Vk.destroyPipelineLayout device) Nothing)
+
+  let
+    pipelineCreateInfoChain =
+      (zero :: Vk.GraphicsPipelineCreateInfo '[])
+        { Vk.stageCount = 2
+        , Vk.stages = SomeStruct <$> shaderStages
+        , Vk.vertexInputState = Just $ SomeStruct vertexInputInfo
+        , Vk.inputAssemblyState = Just inputAssemblyState
+        , Vk.viewportState = Just $ SomeStruct viewportState
+        , Vk.rasterizationState = Just $ SomeStruct rasterizer
+        , Vk.multisampleState = Just $ SomeStruct multisampling
+        , Vk.colorBlendState = Just $ SomeStruct colorBlending
+        , Vk.dynamicState = Just dynamicState
+        , Vk.layout = pipelineLayout
+        , Vk.renderPass = Vk.NULL_HANDLE
+        , Vk.next =
+            (zero :: Vk.PipelineRenderingCreateInfo)
+              { Vk.colorAttachmentFormats = Vector.singleton swapChainSurfaceFormat.format
+              }
+              :& ()
+        }
+
+  (graphicsPipelineReleaseKey, graphicsPipeline) <-
+    allocate
+      do
+        pipelines <-
+          withResultCheck "Failed to create graphics pipeline" $
+            Vk.createGraphicsPipelines device zero (Vector.singleton $ SomeStruct pipelineCreateInfoChain) Nothing
+        pure $ assert (Vector.length pipelines == 1) (Vector.head pipelines)
+      (flip (Vk.destroyPipeline device) Nothing)
+
+  release shaderModuleKey
+
+  pure (graphicsPipelineReleaseKey, graphicsPipeline, pipelineLayoutReleaseKey)
 
 initVulkan ::
   Bool ->
@@ -397,8 +515,9 @@ initVulkan ::
     , Maybe (ReleaseKey, Vk.DebugUtilsMessengerEXT)
     , (ReleaseKey, Vk.Device, Vk.Queue)
     , (ReleaseKey, Vk.SurfaceKHR)
-    , (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image)
+    , (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
     , (Vector (ReleaseKey, Vk.ImageView))
+    , (ReleaseKey, Vk.Pipeline, ReleaseKey)
     )
 initVulkan enableValidationLayers window = do
   insts@(_, inst) <- createInstance enableValidationLayers
@@ -406,9 +525,11 @@ initVulkan enableValidationLayers window = do
   surfaces@(_, surface) <- createSurface inst window
   physicalDevice <- liftIO $ pickPhysicalDevice inst
   logicalDevices@(_, device, _) <- createLogicalDevice physicalDevice surface
-  swapChains@(_, _, swapChainSurfaceFormat, swapChainImages) <- createSwapChain device physicalDevice surface window
+  swapChains@(_, _, swapChainSurfaceFormat, swapChainImages, swapChainExtent) <-
+    createSwapChain device physicalDevice surface window
   imageViews <- createImageViews swapChainSurfaceFormat swapChainImages device
-  pure (insts, dbgMsgsMb, logicalDevices, surfaces, swapChains, imageViews)
+  graphicsPipeline <- createGraphicsPipeline device swapChainExtent swapChainSurfaceFormat
+  pure (insts, dbgMsgsMb, logicalDevices, surfaces, swapChains, imageViews, graphicsPipeline)
 
 mainLoop :: MonadApplication ()
 mainLoop = do
@@ -419,6 +540,7 @@ mainLoop = do
 cleanup :: MonadApplication ()
 cleanup = do
   Application{..} <- ask
+  traverse_ release [graphicsPipelineKey, pipelineLayoutKey]
   traverse_ release swapChainImageViewsKeys
   traverse_ release [swapChainKey, surfaceKey, deviceKey]
   traverse_ release debugMessengerKeyMb
@@ -433,8 +555,9 @@ defaultMain = do
           , dbgMsgsMb
           , (deviceKey, _device, _queue)
           , (surfaceKey, _surface)
-          , (swapChainKey, _swapChain, _swapChainSurfaceFormat, _swapChainImages)
+          , (swapChainKey, _swapChain, _swapChainSurfaceFormat, _swapChainImages, _swapChainExtent)
           , (Vector.unzip -> (swapChainImageViewsKeys, _swapChainImageViews))
+          , (graphicsPipelineKey, _graphicsPipeline, pipelineLayoutKey)
           ) <-
           initVulkan enableValidationLayers window
         let debugMessengerKeyMb = fst <$> dbgMsgsMb
