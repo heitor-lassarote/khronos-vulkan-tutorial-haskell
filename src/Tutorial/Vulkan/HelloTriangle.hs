@@ -10,7 +10,7 @@ import Control.Monad.Trans.Resource (MonadResource, ReleaseKey, ResIO, allocate,
 import Data.Bits (shift, zeroBits, (.&.), (.|.))
 import Data.ByteString.Char8 (ByteString)
 import Data.ByteString.Char8 qualified as BS
-import Data.Foldable (find, for_, traverse_)
+import Data.Foldable (find, for_)
 import Data.Kind (Type)
 import Data.Maybe (fromJust, fromMaybe, isJust)
 import Data.Ord (clamp)
@@ -33,10 +33,6 @@ type Application :: Type
 data Application = Application
   { window :: GLFW.Window
   , width, height :: Int
-  , glfwKey, windowKey, instanceKey, deviceKey, surfaceKey, swapChainKey :: ReleaseKey
-  , debugMessengerKeyMb :: Maybe ReleaseKey
-  , swapChainImageViewsKeys :: Vector ReleaseKey
-  , graphicsPipelineKey, pipelineLayoutKey :: ReleaseKey
   }
 
 type MonadApplication :: Type -> Type
@@ -70,13 +66,13 @@ defaultWidth, defaultHeight :: Int
 defaultWidth = 800
 defaultHeight = 600
 
-initWindow :: Int -> Int -> ResIO (ReleaseKey, ReleaseKey, GLFW.Window)
+initWindow :: Int -> Int -> ResIO GLFW.Window
 initWindow width height = do
-  glfwKey <- allocate_ GLFW.init GLFW.terminate
+  _glfwKey <- allocate_ GLFW.init GLFW.terminate
 
   liftIO $ GLFW.windowHint $ GLFW.WindowHint'ClientAPI GLFW.ClientAPI'NoAPI
   liftIO $ GLFW.windowHint $ GLFW.WindowHint'Resizable False
-  (winKey, win) <-
+  (_winKey, win) <-
     allocate
       ( GLFW.createWindow width height "Vulkan" Nothing Nothing >>= \case
           Nothing -> throwIO $ RuntimeError "Could not create window"
@@ -84,7 +80,7 @@ initWindow width height = do
       )
       GLFW.destroyWindow
 
-  pure (glfwKey, winKey, win)
+  pure win
 
 makeVersion :: Word32 -> Word32 -> Word32 -> Word32
 makeVersion major minor patch = major `shift` 22 .|. minor `shift` 12 .|. patch
@@ -103,7 +99,7 @@ getRequiredInstanceExtensions enableValidationLayers = do
 
   pure $ (if enableValidationLayers then Vector.cons Vk.EXT_DEBUG_UTILS_EXTENSION_NAME else id) glfwExtensions
 
-createInstance :: Bool -> ResIO (ReleaseKey, Vk.Instance)
+createInstance :: Bool -> ResIO Vk.Instance
 createInstance enableValidationLayers = do
   when enableValidationLayers do
     layerNames <-
@@ -131,16 +127,18 @@ createInstance enableValidationLayers = do
         , Vk.enabledLayerNames = requiredLayers
         }
 
-  allocate
-    (Vk.createInstance appInfo Nothing)
-    (\inst -> Vk.destroyInstance inst Nothing)
+  (_instKey, inst) <-
+    allocate
+      (Vk.createInstance appInfo Nothing)
+      (\inst -> Vk.destroyInstance inst Nothing)
+  pure inst
  where
   requiredLayers =
     if enableValidationLayers
       then Vector.singleton "VK_LAYER_KHRONOS_validation"
       else Vector.empty
 
-setupDebugMessenger :: Bool -> Vk.Instance -> ResIO (Maybe (ReleaseKey, Vk.DebugUtilsMessengerEXT))
+setupDebugMessenger :: Bool -> Vk.Instance -> ResIO (Maybe Vk.DebugUtilsMessengerEXT)
 setupDebugMessenger enableValidationLayers inst =
   if enableValidationLayers
     then do
@@ -151,10 +149,11 @@ setupDebugMessenger enableValidationLayers inst =
             , Vk.messageType = messageTypeFlags
             , Vk.pfnUserCallback = debugCallbackPtr
             }
-      Just
-        <$> allocate
+      (_debugUtilsMessengerKey, debugUtilsMessenger) <-
+        allocate
           (Vk.createDebugUtilsMessengerEXT inst createInfo Nothing)
           (flip (Vk.destroyDebugUtilsMessengerEXT inst) Nothing)
+      pure $ Just debugUtilsMessenger
     else
       pure Nothing
  where
@@ -225,7 +224,7 @@ iFindIndexM predicate v = go 0
           False -> go $ i + 1
           True -> pure $ Just i
 
-createLogicalDevice :: Vk.PhysicalDevice -> Vk.SurfaceKHR -> ResIO (ReleaseKey, Vk.Device, Vk.Queue)
+createLogicalDevice :: Vk.PhysicalDevice -> Vk.SurfaceKHR -> ResIO (Vk.Device, Vk.Queue)
 createLogicalDevice physicalDevice surface = do
   queueFamilyProperties <- Vk.getPhysicalDeviceQueueFamilyProperties physicalDevice
 
@@ -266,22 +265,23 @@ createLogicalDevice physicalDevice surface = do
         , Vk.queueCreateInfos = Vector.singleton $ SomeStruct deviceQueueCreateInfo
         , Vk.enabledExtensionNames = requiredDeviceExtensions
         }
-  (deviceReleaseKey, device) <-
+  (_deviceReleaseKey, device) <-
     allocate
       (Vk.createDevice physicalDevice deviceCreateInfo Nothing)
       (flip Vk.destroyDevice Nothing)
   graphicsQueue <- Vk.getDeviceQueue device (fromIntegral graphicsIndex) (fromIntegral queueIndex)
-  pure (deviceReleaseKey, device, graphicsQueue)
+  pure (device, graphicsQueue)
 
-createSurface :: Vk.Instance -> GLFW.Window -> ResIO (ReleaseKey, Vk.SurfaceKHR)
+createSurface :: Vk.Instance -> GLFW.Window -> ResIO Vk.SurfaceKHR
 createSurface inst window = do
-  allocate
-    ( alloca \surfPtr ->
-        GLFW.createWindowSurface @Int (Vk.instanceHandle inst) window nullPtr surfPtr >>= \case
-          0 -> peek surfPtr
-          r -> throwIO $ RuntimeError $ "Failed to create window surface: " <> show r
-    )
-    (flip (Vk.destroySurfaceKHR inst) Nothing)
+  snd
+    <$> allocate
+      ( alloca \surfPtr ->
+          GLFW.createWindowSurface @Int (Vk.instanceHandle inst) window nullPtr surfPtr >>= \case
+            0 -> peek surfPtr
+            r -> throwIO $ RuntimeError $ "Failed to create window surface: " <> show r
+      )
+      (flip (Vk.destroySurfaceKHR inst) Nothing)
 
 chooseSwapSurfaceFormat :: Vector Vk.SurfaceFormatKHR -> Vk.SurfaceFormatKHR
 chooseSwapSurfaceFormat availableFormats =
@@ -327,7 +327,7 @@ createSwapChain ::
   Vk.PhysicalDevice ->
   Vk.SurfaceKHR ->
   GLFW.Window ->
-  ResIO (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
+  ResIO (Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
 createSwapChain device physicalDevice surface window = do
   surfaceCapabilities <- Vk.getPhysicalDeviceSurfaceCapabilitiesKHR physicalDevice surface
   swapChainExtent <- chooseSwapExtent surfaceCapabilities window
@@ -356,20 +356,20 @@ createSwapChain device physicalDevice surface window = do
         , Vk.presentMode
         , Vk.clipped = True
         }
-  (swapChainReleaseKey, swapChain) <-
+  (_swapChainReleaseKey, swapChain) <-
     allocate
       (Vk.createSwapchainKHR device swapChainCreateInfo Nothing)
       (flip (Vk.destroySwapchainKHR device) Nothing)
   swapChainImages <-
     withResultCheck "Failed to get swapchain images" $
       Vk.getSwapchainImagesKHR device swapChain
-  pure (swapChainReleaseKey, swapChain, swapChainSurfaceFormat, swapChainImages, swapChainExtent)
+  pure (swapChain, swapChainSurfaceFormat, swapChainImages, swapChainExtent)
 
 createImageViews ::
   Vk.SurfaceFormatKHR ->
   Vector Vk.Image ->
   Vk.Device ->
-  ResIO (Vector (ReleaseKey, Vk.ImageView))
+  ResIO (Vector Vk.ImageView)
 createImageViews swapChainSurfaceFormat swapChainImages device = do
   let
     imageViewCreateInfo =
@@ -387,9 +387,10 @@ createImageViews swapChainSurfaceFormat swapChainImages device = do
         }
   traverse
     ( \image ->
-        allocate
-          (Vk.createImageView device imageViewCreateInfo{Vk.image} Nothing)
-          (flip (Vk.destroyImageView device) Nothing)
+        snd
+          <$> allocate
+            (Vk.createImageView device imageViewCreateInfo{Vk.image} Nothing)
+            (flip (Vk.destroyImageView device) Nothing)
     )
     swapChainImages
 
@@ -401,7 +402,7 @@ createShaderModule device code = do
     (flip (Vk.destroyShaderModule device) Nothing)
 
 createGraphicsPipeline ::
-  Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR -> ResIO (ReleaseKey, Vk.Pipeline, ReleaseKey)
+  Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR -> ResIO Vk.Pipeline
 createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
@@ -468,7 +469,7 @@ createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
         }
 
     pipelineLayoutInfo = zero :: Vk.PipelineLayoutCreateInfo
-  (pipelineLayoutReleaseKey, pipelineLayout) <-
+  (_pipelineLayoutReleaseKey, pipelineLayout) <-
     allocate
       (Vk.createPipelineLayout device pipelineLayoutInfo Nothing)
       (flip (Vk.destroyPipelineLayout device) Nothing)
@@ -494,7 +495,7 @@ createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
               :& ()
         }
 
-  (graphicsPipelineReleaseKey, graphicsPipeline) <-
+  (_graphicsPipelineReleaseKey, graphicsPipeline) <-
     allocate
       do
         pipelines <-
@@ -505,31 +506,21 @@ createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
 
   release shaderModuleKey
 
-  pure (graphicsPipelineReleaseKey, graphicsPipeline, pipelineLayoutReleaseKey)
+  pure graphicsPipeline
 
-initVulkan ::
-  Bool ->
-  GLFW.Window ->
-  ResIO
-    ( (ReleaseKey, Vk.Instance)
-    , Maybe (ReleaseKey, Vk.DebugUtilsMessengerEXT)
-    , (ReleaseKey, Vk.Device, Vk.Queue)
-    , (ReleaseKey, Vk.SurfaceKHR)
-    , (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
-    , (Vector (ReleaseKey, Vk.ImageView))
-    , (ReleaseKey, Vk.Pipeline, ReleaseKey)
-    )
-initVulkan enableValidationLayers window = do
-  insts@(_, inst) <- createInstance enableValidationLayers
-  dbgMsgsMb <- setupDebugMessenger enableValidationLayers inst
-  surfaces@(_, surface) <- createSurface inst window
+initVulkan :: Bool -> Int -> Int -> ResIO Application
+initVulkan enableValidationLayers width height = do
+  window <- initWindow width height
+  inst <- createInstance enableValidationLayers
+  _dbgMsgsMb <- setupDebugMessenger enableValidationLayers inst
+  surface <- createSurface inst window
   physicalDevice <- liftIO $ pickPhysicalDevice inst
-  logicalDevices@(_, device, _) <- createLogicalDevice physicalDevice surface
-  swapChains@(_, _, swapChainSurfaceFormat, swapChainImages, swapChainExtent) <-
+  (device, _queue) <- createLogicalDevice physicalDevice surface
+  (_swapChain, swapChainSurfaceFormat, swapChainImages, swapChainExtent) <-
     createSwapChain device physicalDevice surface window
-  imageViews <- createImageViews swapChainSurfaceFormat swapChainImages device
-  graphicsPipeline <- createGraphicsPipeline device swapChainExtent swapChainSurfaceFormat
-  pure (insts, dbgMsgsMb, logicalDevices, surfaces, swapChains, imageViews, graphicsPipeline)
+  _imageViews <- createImageViews swapChainSurfaceFormat swapChainImages device
+  _graphicsPipeline <- createGraphicsPipeline device swapChainExtent swapChainSurfaceFormat
+  pure Application{..}
 
 mainLoop :: MonadApplication ()
 mainLoop = do
@@ -537,33 +528,13 @@ mainLoop = do
   whileM_ (liftIO $ fmap not $ GLFW.windowShouldClose window) do
     liftIO GLFW.pollEvents
 
-cleanup :: MonadApplication ()
-cleanup = do
-  Application{..} <- ask
-  traverse_ release [graphicsPipelineKey, pipelineLayoutKey]
-  traverse_ release swapChainImageViewsKeys
-  traverse_ release [swapChainKey, surfaceKey, deviceKey]
-  traverse_ release debugMessengerKeyMb
-  traverse_ release [instanceKey, windowKey, glfwKey]
-
 defaultMain :: IO ()
 defaultMain = do
   catch
     ( runResourceT do
-        (glfwKey, windowKey, window) <- initWindow width height
-        ( (instanceKey, _inst)
-          , dbgMsgsMb
-          , (deviceKey, _device, _queue)
-          , (surfaceKey, _surface)
-          , (swapChainKey, _swapChain, _swapChainSurfaceFormat, _swapChainImages, _swapChainExtent)
-          , (Vector.unzip -> (swapChainImageViewsKeys, _swapChainImageViews))
-          , (graphicsPipelineKey, _graphicsPipeline, pipelineLayoutKey)
-          ) <-
-          initVulkan enableValidationLayers window
-        let debugMessengerKeyMb = fst <$> dbgMsgsMb
-        flip runReaderT Application{..} $ (.runMonadApplication) do
+        application <- initVulkan enableValidationLayers width height
+        flip runReaderT application $ (.runMonadApplication) do
           mainLoop
-          cleanup
     )
     \(err :: SomeException) ->
       hPutStrLn stderr $ displayException err
