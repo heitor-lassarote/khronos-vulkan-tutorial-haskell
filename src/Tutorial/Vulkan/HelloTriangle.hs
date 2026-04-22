@@ -6,11 +6,13 @@ import Control.Monad (unless, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Loops (whileM_)
 import Control.Monad.Reader (MonadReader (..), ReaderT (..))
+import Control.Monad.Trans (lift)
 import Control.Monad.Trans.Resource (MonadResource, ReleaseKey, ResIO, allocate, allocate_, release, runResourceT)
 import Data.Bits (shift, zeroBits, (.&.), (.|.))
 import Data.ByteString.Char8 (ByteString)
 import Data.ByteString.Char8 qualified as BS
-import Data.Foldable (find, for_)
+import Data.Foldable (find, for_, traverse_)
+import Data.Functor ((<&>))
 import Data.Kind (Type)
 import Data.Maybe (fromJust, fromMaybe, isJust)
 import Data.Ord (clamp)
@@ -20,11 +22,13 @@ import Data.Word (Word32)
 import Graphics.UI.GLFW qualified as GLFW
 import System.FilePath ((<.>), (</>))
 import System.IO (hPutStrLn, stderr)
-import UnliftIO.Exception (Exception (displayException), SomeException, assert, catch, throwIO)
+import UnliftIO (IORef, MonadUnliftIO)
+import UnliftIO.Exception (Exception (displayException), SomeException, assert, catch, finally, throwIO)
 import UnliftIO.Foreign (Storable (..), alloca, nullPtr, peekCString)
 import UnliftIO.IORef (newIORef, readIORef, writeIORef)
 import Vulkan qualified as Vk
 import Vulkan.CStruct.Extends (SomeStruct (..), pattern (:&))
+import Vulkan.Exception (VulkanException (..))
 import Vulkan.Zero (zero)
 
 foreign import ccall unsafe "debug_callback.c &debug_callback"
@@ -37,26 +41,36 @@ data Frame = Frame
   , commandBuffer :: Vk.CommandBuffer
   }
 
+type Swapchain :: Type
+data Swapchain = Swapchain
+  { swapchain :: Vk.SwapchainKHR
+  , surfaceFormat :: Vk.SurfaceFormatKHR
+  , releaseKey :: ReleaseKey
+  , images :: Vector Vk.Image
+  , extent :: Vk.Extent2D
+  , imageViews :: Vector Vk.ImageView
+  , imageViewsReleaseKeys :: Vector ReleaseKey
+  }
+
 type Application :: Type
 data Application = Application
   { window :: GLFW.Window
-  , width, height :: Int
   , frames :: Vector Frame
+  , surface :: Vk.SurfaceKHR
+  , physicalDevice :: Vk.PhysicalDevice
   , device :: Vk.Device
   , queue :: Vk.Queue
-  , swapChain :: Vk.SwapchainKHR
-  , swapChainImages :: Vector Vk.Image
-  , swapChainExtent :: Vk.Extent2D
-  , swapChainImageViews :: Vector Vk.ImageView
+  , swapchainRef :: IORef Swapchain
   , renderFinishedSemaphores :: Vector Vk.Semaphore
   , graphicsPipeline :: Vk.Pipeline
+  , framebufferResizedRef :: IORef Bool
   }
 
 type MonadApplication :: Type -> Type
 newtype MonadApplication a = MonadApplication
   { runMonadApplication :: ReaderT Application ResIO a
   }
-  deriving newtype (Functor, Applicative, Monad, MonadIO, MonadResource)
+  deriving newtype (Functor, Applicative, Monad, MonadIO, MonadResource, MonadUnliftIO)
 
 instance MonadReader Application MonadApplication where
   ask = MonadApplication ask
@@ -73,9 +87,9 @@ checkResult message result =
     Vk.SUCCESS -> pure ()
     _ -> throwIO $ RuntimeError $ "[" <> show result <> "] " <> message
 
-withResultCheck :: (MonadIO io) => String -> IO (Vk.Result, a) -> io a
+withResultCheck :: (MonadIO io) => String -> io (Vk.Result, a) -> io a
 withResultCheck msg action = do
-  (result, ret) <- liftIO action
+  (result, ret) <- action
   checkResult msg result
   pure ret
 
@@ -86,13 +100,13 @@ defaultHeight = 600
 maxFramesInFlight :: Int
 maxFramesInFlight = 2
 
-initWindow :: Int -> Int -> ResIO GLFW.Window
-initWindow width height = do
-  _glfwKey <- allocate_ GLFW.init GLFW.terminate
+initWindow :: Int -> Int -> IORef Bool -> ResIO GLFW.Window
+initWindow width height framebufferResizedRef = do
+  _glfwKeyReleaseKey <- allocate_ GLFW.init GLFW.terminate
 
   liftIO $ GLFW.windowHint $ GLFW.WindowHint'ClientAPI GLFW.ClientAPI'NoAPI
-  liftIO $ GLFW.windowHint $ GLFW.WindowHint'Resizable False
-  (_winKey, win) <-
+  liftIO $ GLFW.windowHint $ GLFW.WindowHint'Resizable True
+  (_windowReleaseKey, window) <-
     allocate
       ( GLFW.createWindow width height "Vulkan" Nothing Nothing >>= \case
           Nothing -> throwIO $ RuntimeError "Could not create window"
@@ -100,7 +114,10 @@ initWindow width height = do
       )
       GLFW.destroyWindow
 
-  pure win
+  liftIO $ GLFW.setFramebufferSizeCallback window $ Just \_window _width _height ->
+    writeIORef framebufferResizedRef True
+
+  pure window
 
 makeVersion :: Word32 -> Word32 -> Word32 -> Word32
 makeVersion major minor patch = major `shift` 22 .|. minor `shift` 12 .|. patch
@@ -346,15 +363,15 @@ chooseSwapMinImageCount capabilities
  where
   minImageCount = max 3 capabilities.minImageCount
 
-createSwapChain ::
+createSwapchain ::
   Vk.Device ->
   Vk.PhysicalDevice ->
   Vk.SurfaceKHR ->
   GLFW.Window ->
-  ResIO (Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
-createSwapChain device physicalDevice surface window = do
+  ResIO (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
+createSwapchain device physicalDevice surface window = do
   surfaceCapabilities <- Vk.getPhysicalDeviceSurfaceCapabilitiesKHR physicalDevice surface
-  swapChainExtent <- chooseSwapExtent surfaceCapabilities window
+  swapchainExtent <- chooseSwapExtent surfaceCapabilities window
   let minImageCount = chooseSwapMinImageCount surfaceCapabilities
   availableFormats <-
     withResultCheck "Failed to get physical device surface formats" $
@@ -364,14 +381,14 @@ createSwapChain device physicalDevice surface window = do
       Vk.getPhysicalDeviceSurfacePresentModesKHR physicalDevice surface
   let
     presentMode = chooseSwapPresentMode availablePresentModes
-    swapChainSurfaceFormat = chooseSwapSurfaceFormat availableFormats
-    swapChainCreateInfo =
+    swapchainSurfaceFormat = chooseSwapSurfaceFormat availableFormats
+    swapchainCreateInfo =
       (zero :: Vk.SwapchainCreateInfoKHR '[])
         { Vk.surface
         , Vk.minImageCount
-        , Vk.imageFormat = swapChainSurfaceFormat.format
-        , Vk.imageColorSpace = swapChainSurfaceFormat.colorSpace
-        , Vk.imageExtent = swapChainExtent
+        , Vk.imageFormat = swapchainSurfaceFormat.format
+        , Vk.imageColorSpace = swapchainSurfaceFormat.colorSpace
+        , Vk.imageExtent = swapchainExtent
         , Vk.imageArrayLayers = 1
         , Vk.imageUsage = Vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT
         , Vk.imageSharingMode = Vk.SHARING_MODE_EXCLUSIVE
@@ -380,26 +397,26 @@ createSwapChain device physicalDevice surface window = do
         , Vk.presentMode
         , Vk.clipped = True
         }
-  (_swapChainReleaseKey, swapChain) <-
+  (swapchainReleaseKey, swapchain) <-
     allocate
-      (Vk.createSwapchainKHR device swapChainCreateInfo Nothing)
+      (Vk.createSwapchainKHR device swapchainCreateInfo Nothing)
       (flip (Vk.destroySwapchainKHR device) Nothing)
-  swapChainImages <-
+  swapchainImages <-
     withResultCheck "Failed to get swapchain images" $
-      Vk.getSwapchainImagesKHR device swapChain
-  pure (swapChain, swapChainSurfaceFormat, swapChainImages, swapChainExtent)
+      Vk.getSwapchainImagesKHR device swapchain
+  pure (swapchainReleaseKey, swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent)
 
 createImageViews ::
   Vk.SurfaceFormatKHR ->
   Vector Vk.Image ->
   Vk.Device ->
-  ResIO (Vector Vk.ImageView)
-createImageViews swapChainSurfaceFormat swapChainImages device = do
+  ResIO (Vector ReleaseKey, Vector Vk.ImageView)
+createImageViews swapchainSurfaceFormat swapchainImages device = do
   let
     imageViewCreateInfo =
       (zero :: Vk.ImageViewCreateInfo '[])
         { Vk.viewType = Vk.IMAGE_VIEW_TYPE_2D
-        , Vk.format = swapChainSurfaceFormat.format
+        , Vk.format = swapchainSurfaceFormat.format
         , Vk.subresourceRange =
             Vk.ImageSubresourceRange
               { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
@@ -409,14 +426,14 @@ createImageViews swapChainSurfaceFormat swapChainImages device = do
               , Vk.layerCount = 1
               }
         }
-  traverse
-    ( \image ->
-        snd
-          <$> allocate
+  Vector.unzip
+    <$> traverse
+      ( \image ->
+          allocate
             (Vk.createImageView device imageViewCreateInfo{Vk.image} Nothing)
             (flip (Vk.destroyImageView device) Nothing)
-    )
-    swapChainImages
+      )
+      swapchainImages
 
 createShaderModule :: Vk.Device -> ByteString -> ResIO (ReleaseKey, Vk.ShaderModule)
 createShaderModule device code = do
@@ -427,7 +444,7 @@ createShaderModule device code = do
 
 createGraphicsPipeline ::
   Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR -> ResIO Vk.Pipeline
-createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
+createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
   let
@@ -514,7 +531,7 @@ createGraphicsPipeline device _swapChainExtent swapChainSurfaceFormat = do
         , Vk.renderPass = Vk.NULL_HANDLE
         , Vk.next =
             (zero :: Vk.PipelineRenderingCreateInfo)
-              { Vk.colorAttachmentFormats = Vector.singleton swapChainSurfaceFormat.format
+              { Vk.colorAttachmentFormats = Vector.singleton swapchainSurfaceFormat.format
               }
               :& ()
         }
@@ -547,7 +564,7 @@ createCommandPool device queueIndex = do
 
 createSyncObjects ::
   Vk.Device -> Vector Vk.Image -> ResIO (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
-createSyncObjects device swapChainImages = do
+createSyncObjects device swapchainImages = do
   -- Signal that an image has been acquired from the swapchain and is ready for rendering
   presentCompleteSemaphores <-
     Vector.replicateM
@@ -560,7 +577,7 @@ createSyncObjects device swapChainImages = do
   -- Signal that rendering has finished and presentation can happen
   renderFinishedSemaphores <-
     Vector.replicateM
-      (Vector.length swapChainImages)
+      (Vector.length swapchainImages)
       ( snd
           <$> allocate
             (Vk.createSemaphore device zero Nothing)
@@ -579,20 +596,22 @@ createSyncObjects device swapChainImages = do
 
 initVulkan :: Bool -> Int -> Int -> ResIO Application
 initVulkan enableValidationLayers width height = do
-  window <- initWindow width height
+  framebufferResizedRef <- newIORef False
+  window <- initWindow width height framebufferResizedRef
   inst <- createInstance enableValidationLayers
   _dbgMsgsMb <- setupDebugMessenger enableValidationLayers inst
   surface <- createSurface inst window
   physicalDevice <- liftIO $ pickPhysicalDevice inst
   (device, queue, queueIndex) <- createLogicalDevice physicalDevice surface
-  (swapChain, swapChainSurfaceFormat, swapChainImages, swapChainExtent) <-
-    createSwapChain device physicalDevice surface window
-  swapChainImageViews <- createImageViews swapChainSurfaceFormat swapChainImages device
-  graphicsPipeline <- createGraphicsPipeline device swapChainExtent swapChainSurfaceFormat
+  (swapchainReleaseKey, swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent) <-
+    createSwapchain device physicalDevice surface window
+  (swapchainImageViewsReleaseKeys, swapchainImageViews) <-
+    createImageViews swapchainSurfaceFormat swapchainImages device
+  graphicsPipeline <- createGraphicsPipeline device swapchainExtent swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
-    createSyncObjects device swapChainImages
+    createSyncObjects device swapchainImages
   let
     frames =
       Vector.zipWith3
@@ -600,6 +619,17 @@ initVulkan enableValidationLayers width height = do
         presentCompleteSemaphores
         inFlightFences
         commandBuffers
+  swapchainRef <-
+    newIORef
+      Swapchain
+        { swapchain
+        , surfaceFormat = swapchainSurfaceFormat
+        , releaseKey = swapchainReleaseKey
+        , images = swapchainImages
+        , extent = swapchainExtent
+        , imageViews = swapchainImageViews
+        , imageViewsReleaseKeys = swapchainImageViewsReleaseKeys
+        }
   pure Application{..}
 
 createCommandBuffers :: Vk.Device -> Vk.CommandPool -> ResIO (Vector Vk.CommandBuffer)
@@ -619,8 +649,7 @@ createCommandBuffers device commandPool = do
 recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
 recordCommandBuffer imageIndex frame = do
   Application
-    { swapChainImageViews
-    , swapChainExtent
+    { swapchainRef
     , graphicsPipeline
     } <-
     ask
@@ -636,11 +665,13 @@ recordCommandBuffer imageIndex frame = do
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     frame
+
+  swapchain <- readIORef swapchainRef
   let
     clearColor = Vk.Color $ Vk.Float32 0 0 0 1
     attachmentInfo =
       (zero :: Vk.RenderingAttachmentInfo)
-        { Vk.imageView = swapChainImageViews Vector.! fromIntegral imageIndex
+        { Vk.imageView = swapchain.imageViews Vector.! fromIntegral imageIndex
         , Vk.imageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
         , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
         , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
@@ -648,7 +679,7 @@ recordCommandBuffer imageIndex frame = do
         }
     renderingInfo =
       (zero :: Vk.RenderingInfo '[])
-        { Vk.renderArea = zero{Vk.offset = Vk.Offset2D 0 0, Vk.extent = swapChainExtent}
+        { Vk.renderArea = zero{Vk.offset = Vk.Offset2D 0 0, Vk.extent = swapchain.extent}
         , Vk.layerCount = 1
         , Vk.colorAttachments = Vector.singleton attachmentInfo
         }
@@ -660,9 +691,9 @@ recordCommandBuffer imageIndex frame = do
     frame.commandBuffer
     0
     ( Vector.singleton $
-        Vk.Viewport 0 0 (fromIntegral swapChainExtent.width) (fromIntegral swapChainExtent.height) 0 1
+        Vk.Viewport 0 0 (fromIntegral swapchain.extent.width) (fromIntegral swapchain.extent.height) 0 1
     )
-  Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapChainExtent))
+  Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapchain.extent))
   Vk.cmdDraw frame.commandBuffer 3 1 0 0
 
   Vk.cmdEndRendering frame.commandBuffer
@@ -698,7 +729,8 @@ transitionImageLayout
   srcStageMask
   dstStageMask
   frame = do
-    Application{swapChainImages} <- ask
+    Application{swapchainRef} <- ask
+    swapchain <- readIORef swapchainRef
     let
       barrier =
         (zero :: Vk.ImageMemoryBarrier2 '[])
@@ -710,7 +742,7 @@ transitionImageLayout
           , Vk.newLayout
           , Vk.srcQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
           , Vk.dstQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
-          , Vk.image = swapChainImages Vector.! fromIntegral imageIndex
+          , Vk.image = swapchain.images Vector.! fromIntegral imageIndex
           , Vk.subresourceRange =
               zero
                 { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
@@ -727,66 +759,130 @@ transitionImageLayout
           }
     Vk.cmdPipelineBarrier2 frame.commandBuffer dependencyInfo
 
-drawFrame :: Int -> MonadApplication ()
+drawFrame :: Int -> MonadApplication Bool
 drawFrame frameIndex = do
   Application{..} <- ask
   let frame = frames Vector.! frameIndex
   let drawFences = Vector.singleton frame.inFlightFence
   Vk.waitForFences device drawFences True maxBound
     >>= checkResult "Failed to wait for fence!"
-  Vk.resetFences device drawFences
 
-  (_imageIndexResult, imageIndex) <-
-    Vk.acquireNextImageKHR device swapChain maxBound frame.presentCompleteSemaphore zero
-  recordCommandBuffer imageIndex frame
+  swapchain <- readIORef swapchainRef
+  (imageIndexResult, imageIndex) <-
+    Vk.acquireNextImageKHR device swapchain.swapchain maxBound frame.presentCompleteSemaphore zero
+      `catch` \exn@(VulkanException r) ->
+        if r == Vk.ERROR_OUT_OF_DATE_KHR
+          then pure (r, 0)
+          else throwIO exn
+  case imageIndexResult of
+    Vk.SUCCESS -> continue drawFences imageIndex frame swapchain
+    Vk.SUBOPTIMAL_KHR -> continue drawFences imageIndex frame swapchain
+    Vk.ERROR_OUT_OF_DATE_KHR -> False <$ recreateSwapchain
+    _ -> do
+      checkResult "Failed to acquire swap chain image!" $
+        assert (imageIndexResult == Vk.TIMEOUT || imageIndexResult == Vk.NOT_READY) imageIndexResult
+      pure False
+ where
+  continue :: Vector Vk.Fence -> Word32 -> Frame -> Swapchain -> MonadApplication Bool
+  continue drawFences imageIndex frame swapchain = do
+    Application{..} <- ask
 
-  let
-    waitDestinationStageMask = Vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-    renderFinishedSemaphore = Vector.singleton $ renderFinishedSemaphores Vector.! fromIntegral imageIndex
-    submitInfo =
-      (zero :: Vk.SubmitInfo '[])
-        { Vk.waitSemaphores = Vector.singleton frame.presentCompleteSemaphore
-        , Vk.waitDstStageMask = Vector.singleton waitDestinationStageMask
-        , Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle $ frame.commandBuffer
-        , Vk.signalSemaphores = renderFinishedSemaphore
-        }
-  Vk.queueSubmit queue (Vector.singleton $ SomeStruct submitInfo) frame.inFlightFence
+    -- Only reset the fence if we are submitting work
+    Vk.resetFences device drawFences
 
-  let
-    presentInfoKHR =
-      (zero :: Vk.PresentInfoKHR '[])
-        { Vk.waitSemaphores = renderFinishedSemaphore
-        , Vk.swapchains = Vector.singleton swapChain
-        , Vk.imageIndices = Vector.singleton imageIndex
-        }
+    recordCommandBuffer imageIndex frame
 
-  _presentResult <- Vk.queuePresentKHR queue presentInfoKHR
+    let
+      waitDestinationStageMask = Vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+      renderFinishedSemaphore = Vector.singleton $ renderFinishedSemaphores Vector.! fromIntegral imageIndex
+      submitInfo =
+        (zero :: Vk.SubmitInfo '[])
+          { Vk.waitSemaphores = Vector.singleton frame.presentCompleteSemaphore
+          , Vk.waitDstStageMask = Vector.singleton waitDestinationStageMask
+          , Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle $ frame.commandBuffer
+          , Vk.signalSemaphores = renderFinishedSemaphore
+          }
+    Vk.queueSubmit queue (Vector.singleton $ SomeStruct submitInfo) frame.inFlightFence
 
-  pure ()
+    let
+      presentInfoKHR =
+        (zero :: Vk.PresentInfoKHR '[])
+          { Vk.waitSemaphores = renderFinishedSemaphore
+          , Vk.swapchains = Vector.singleton swapchain.swapchain
+          , Vk.imageIndices = Vector.singleton imageIndex
+          }
+
+    framebufferResized <- readIORef framebufferResizedRef
+    catchOutOfDate (Vk.queuePresentKHR queue presentInfoKHR) >>= \case
+      Vk.SUBOPTIMAL_KHR -> do
+        writeIORef framebufferResizedRef False
+        recreateSwapchain
+      Vk.ERROR_OUT_OF_DATE_KHR -> do
+        writeIORef framebufferResizedRef False
+        recreateSwapchain
+      result -> do
+        if framebufferResized
+          then do
+            writeIORef framebufferResizedRef False
+            recreateSwapchain
+          else pure $ assert (result == Vk.SUCCESS) ()
+
+    pure True
+
+catchOutOfDate :: (MonadUnliftIO m) => m Vk.Result -> m Vk.Result
+catchOutOfDate action =
+  action `catch` \exn@(VulkanException r) ->
+    if r == Vk.ERROR_OUT_OF_DATE_KHR
+      then pure r
+      else throwIO exn
+
+cleanupSwapchain :: Vector ReleaseKey -> ReleaseKey -> ResIO ()
+cleanupSwapchain swapchainImageViewsReleaseKeys swapchainReleaseKey = do
+  traverse_ release swapchainImageViewsReleaseKeys
+  release swapchainReleaseKey
+
+recreateSwapchain :: MonadApplication ()
+recreateSwapchain = do
+  Application{..} <- ask
+
+  -- Pause while minimized
+  liftIO $
+    whileM_
+      (GLFW.getFramebufferSize window <&> \(width, height) -> width == 0 || height == 0)
+      GLFW.waitEvents
+
+  Vk.deviceWaitIdle device
+
+  MonadApplication $ lift do
+    do
+      Swapchain{..} <- readIORef swapchainRef
+      cleanupSwapchain imageViewsReleaseKeys releaseKey
+    (releaseKey, swapchain, surfaceFormat, images, extent) <-
+      createSwapchain device physicalDevice surface window
+    (imageViewsReleaseKeys, imageViews) <-
+      createImageViews surfaceFormat images device
+    writeIORef swapchainRef Swapchain{..}
 
 mainLoop :: MonadApplication ()
 mainLoop = do
-  Application{window, device} <- ask
+  Application{window} <- ask
   frameIndexRef <- newIORef 0
   whileM_ (liftIO $ fmap not $ GLFW.windowShouldClose window) do
     frameIndex <- readIORef frameIndexRef
     liftIO GLFW.pollEvents
-    drawFrame frameIndex
-    writeIORef frameIndexRef $ (frameIndex + 1) `mod` maxFramesInFlight
-
-  Vk.deviceWaitIdle device
+    skippedFrame <- drawFrame frameIndex
+    unless skippedFrame do
+      writeIORef frameIndexRef $ (frameIndex + 1) `mod` maxFramesInFlight
 
 defaultMain :: IO ()
 defaultMain = do
   catch
     ( runResourceT do
-        application <- initVulkan enableValidationLayers width height
+        application <- initVulkan enableValidationLayers defaultWidth defaultHeight
         flip runReaderT application $ (.runMonadApplication) do
-          mainLoop
+          mainLoop `finally` Vk.deviceWaitIdle application.device
     )
     \(err :: SomeException) ->
       hPutStrLn stderr $ displayException err
  where
-  width = defaultWidth
-  height = defaultHeight
   enableValidationLayers = True
