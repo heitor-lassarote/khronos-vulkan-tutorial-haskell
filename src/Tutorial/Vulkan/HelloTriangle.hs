@@ -110,13 +110,16 @@ defaultHeight = 600
 maxFramesInFlight :: Int
 maxFramesInFlight = 2
 
+allocate' :: IO a -> (a -> IO ()) -> ResIO a
+allocate' create destroy = snd <$> allocate create destroy
+
 initWindow :: Int -> Int -> IORef Bool -> ResIO GLFW.Window
 initWindow width height framebufferResizedRef = do
   _glfwKeyReleaseKey <- allocate_ GLFW.init GLFW.terminate
 
   liftIO $ GLFW.windowHint $ GLFW.WindowHint'ClientAPI GLFW.ClientAPI'NoAPI
   liftIO $ GLFW.windowHint $ GLFW.WindowHint'Resizable True
-  (_windowReleaseKey, window) <- allocate
+  window <- allocate'
     (GLFW.createWindow width height "Vulkan" Nothing Nothing >>= \case
       Nothing -> throwIO $ RuntimeError "Could not create window"
       Just window -> pure window)
@@ -169,10 +172,7 @@ createInstance enableValidationLayers = do
       , Vk.enabledLayerNames = requiredLayers
       }
 
-  (_instKey, inst) <- allocate
-    (Vk.createInstance appInfo Nothing)
-    (`Vk.destroyInstance` Nothing)
-  pure inst
+  Vk.withInstance appInfo Nothing allocate'
  where
   requiredLayers
     | enableValidationLayers = Vector.singleton "VK_LAYER_KHRONOS_validation"
@@ -187,10 +187,7 @@ setupDebugMessenger enableValidationLayers inst =
         , Vk.messageType = messageTypeFlags
         , Vk.pfnUserCallback = debugCallbackPtr
         }
-    (_debugUtilsMessengerKey, debugUtilsMessenger) <- allocate
-      (Vk.createDebugUtilsMessengerEXT inst createInfo Nothing)
-      (flip (Vk.destroyDebugUtilsMessengerEXT inst) Nothing)
-    pure $ Just debugUtilsMessenger
+    Just <$> Vk.withDebugUtilsMessengerEXT inst createInfo Nothing allocate'
   else
     pure Nothing
  where
@@ -289,15 +286,13 @@ createLogicalDevice physicalDevice surface = do
       , Vk.queueCreateInfos = Vector.singleton $ SomeStruct deviceQueueCreateInfo
       , Vk.enabledExtensionNames = requiredDeviceExtensions
       }
-  (_deviceReleaseKey, device) <- allocate
-    (Vk.createDevice physicalDevice deviceCreateInfo Nothing)
-    (`Vk.destroyDevice` Nothing)
+  device <- Vk.withDevice physicalDevice deviceCreateInfo Nothing allocate'
   graphicsQueue <- Vk.getDeviceQueue device (fromIntegral graphicsIndex) queueIndex
   pure (device, graphicsQueue, queueIndex)
 
 createSurface :: Vk.Instance -> GLFW.Window -> ResIO Vk.SurfaceKHR
 createSurface inst window = do
-  snd <$> allocate
+  allocate'
     (alloca \surfPtr ->
       GLFW.createWindowSurface @Int (Vk.instanceHandle inst) window nullPtr surfPtr >>= \case
         0 -> peek surfPtr
@@ -482,9 +477,7 @@ createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
       }
 
     pipelineLayoutInfo = zero :: Vk.PipelineLayoutCreateInfo
-  (_pipelineLayoutReleaseKey, pipelineLayout) <- allocate
-    (Vk.createPipelineLayout device pipelineLayoutInfo Nothing)
-    (flip (Vk.destroyPipelineLayout device) Nothing)
+  pipelineLayout <- Vk.withPipelineLayout device pipelineLayoutInfo Nothing allocate'
 
   let
     pipelineCreateInfoChain = (zero :: Vk.GraphicsPipelineCreateInfo '[])
@@ -505,13 +498,10 @@ createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
         :& ()
       }
 
-  (_graphicsPipelineReleaseKey, graphicsPipeline) <- allocate
-    do
-      pipelines <-
-        withResultCheck "Failed to create graphics pipeline" $
-          Vk.createGraphicsPipelines device zero (Vector.singleton $ SomeStruct pipelineCreateInfoChain) Nothing
-      pure $ assert (Vector.length pipelines == 1) (Vector.head pipelines)
-    (flip (Vk.destroyPipeline device) Nothing)
+  graphicsPipelines <-
+    withResultCheck "Failed to create graphics pipeline" $
+      Vk.withGraphicsPipelines device zero (Vector.singleton $ SomeStruct pipelineCreateInfoChain) Nothing allocate'
+  let graphicsPipeline = assert (Vector.length graphicsPipelines == 1) (Vector.head graphicsPipelines)
 
   release shaderModuleKey
 
@@ -524,44 +514,84 @@ createCommandPool device queueIndex = do
       { Vk.flags = Vk.COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
       , Vk.queueFamilyIndex = queueIndex
       }
-  snd <$> allocate
-    (Vk.createCommandPool device poolInfo Nothing)
-    (flip (Vk.destroyCommandPool device) Nothing)
+  Vk.withCommandPool device poolInfo Nothing allocate'
 
-createVertexBuffer :: Vk.PhysicalDevice -> Vk.Device -> ResIO (Vk.Buffer, Vk.DeviceMemory)
-createVertexBuffer physicalDevice device = do
+createBuffer
+  :: Vk.PhysicalDevice -> Vk.Device -> Vk.DeviceSize -> Vk.BufferUsageFlags
+  -> Vk.MemoryPropertyFlags -> ResIO (ReleaseKey, ReleaseKey, Vk.Buffer, Vk.DeviceMemory)
+createBuffer physicalDevice device size usage properties = do
   let
-    verticesSize = sizeOf (undefined :: Vertex) * SVector.length vertices
     bufferInfo = (zero :: Vk.BufferCreateInfo '[])
-      { Vk.size = fromIntegral verticesSize
-      , Vk.usage = Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
+      { Vk.size
+      , Vk.usage
       , Vk.sharingMode = Vk.SHARING_MODE_EXCLUSIVE
       }
-  (_vertexBufferReleaseKey, vertexBuffer) <- allocate
+  (bufferReleaseKey, buffer) <- allocate
     (Vk.createBuffer device bufferInfo Nothing)
     (flip (Vk.destroyBuffer device) Nothing)
 
-  memRequirements <- Vk.getBufferMemoryRequirements device vertexBuffer
-  memTypeIndex <- findMemoryType
-    physicalDevice
-    memRequirements.memoryTypeBits
-    (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+  memRequirements <- Vk.getBufferMemoryRequirements device buffer
+  memTypeIndex <- findMemoryType physicalDevice memRequirements.memoryTypeBits properties
   let
     memoryAllocateInfo = (zero :: Vk.MemoryAllocateInfo '[])
       { Vk.allocationSize = memRequirements.size
       , Vk.memoryTypeIndex = memTypeIndex
       }
-  (_vertexBufferMemoryReleaseKey, vertexBufferMemory) <- allocate
+  (bufferMemoryReleaseKey, bufferMemory) <- allocate
     (Vk.allocateMemory device memoryAllocateInfo Nothing)
     (flip (Vk.freeMemory device) Nothing)
 
-  Vk.bindBufferMemory device vertexBuffer vertexBufferMemory 0
-  data' <- Vk.mapMemory device vertexBufferMemory 0 bufferInfo.size zero
+  Vk.bindBufferMemory device buffer bufferMemory 0
+
+  pure (bufferReleaseKey, bufferMemoryReleaseKey, buffer, bufferMemory)
+
+createVertexBuffer
+  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+createVertexBuffer physicalDevice device commandPool graphicsQueue = do
+  let bufferSize = sizeOf (undefined :: Vertex) * SVector.length vertices
+
+  (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
+    physicalDevice
+    device
+    (fromIntegral bufferSize)
+    Vk.BUFFER_USAGE_TRANSFER_SRC_BIT
+    (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+  dataStaging <- Vk.mapMemory device stagingBufferMemory 0 (fromIntegral bufferSize) zero
   liftIO $ SVector.unsafeWith vertices \ptr ->
-    copyBytes (castPtr data') ptr verticesSize
-  Vk.unmapMemory device vertexBufferMemory
+    copyBytes (castPtr dataStaging) ptr bufferSize
+  Vk.unmapMemory device stagingBufferMemory
+
+  (_vertexBufferReleaseKey, _vertexBufferMemoryReleaseKey, vertexBuffer, vertexBufferMemory) <- createBuffer
+    physicalDevice
+    device
+    (fromIntegral bufferSize)
+    (Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT .|. Vk.BUFFER_USAGE_TRANSFER_DST_BIT)
+    Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+
+  copyBuffer device commandPool graphicsQueue stagingBuffer vertexBuffer (fromIntegral bufferSize)
+
+  release stagingBufferMemoryReleaseKey
+  release stagingBufferReleaseKey
 
   pure (vertexBuffer, vertexBufferMemory)
+
+copyBuffer :: Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize -> ResIO ()
+copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size = do
+  let
+    allocInfo = (zero :: Vk.CommandBufferAllocateInfo)
+      { Vk.commandPool
+      , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
+      , Vk.commandBufferCount = 1
+      }
+  commandCopyBuffer <- Vector.head <$> Vk.withCommandBuffers device allocInfo allocate'
+  Vk.useCommandBuffer commandCopyBuffer zero{Vk.flags = Vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT} do
+    Vk.cmdCopyBuffer commandCopyBuffer srcBuffer dstBuffer (Vector.singleton $ Vk.BufferCopy 0 0 size)
+
+  Vk.queueSubmit
+    graphicsQueue
+    (Vector.singleton $ SomeStruct zero{Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle commandCopyBuffer})
+    zero
+  Vk.queueWaitIdle graphicsQueue
 
 findMemoryType :: (MonadIO io) => Vk.PhysicalDevice -> Word32 -> Vk.MemoryPropertyFlags -> io Word32
 findMemoryType physicalDevice typeFilter properties = do
@@ -583,9 +613,7 @@ createCommandBuffers device commandPool = do
       , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
       , Vk.commandBufferCount = fromIntegral maxFramesInFlight
       }
-  snd <$> allocate
-    (Vk.allocateCommandBuffers device allocInfo)
-    (Vk.freeCommandBuffers device commandPool)
+  Vk.withCommandBuffers device allocInfo allocate'
 
 createSyncObjects
   :: Vk.Device -> Vector Vk.Image -> ResIO (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
@@ -593,21 +621,15 @@ createSyncObjects device swapchainImages = do
   -- Signal that an image has been acquired from the swapchain and is ready for rendering
   presentCompleteSemaphores <- Vector.replicateM
     maxFramesInFlight
-    (snd <$> allocate
-      (Vk.createSemaphore device zero Nothing)
-      (flip (Vk.destroySemaphore device) Nothing))
+    (Vk.withSemaphore device zero Nothing allocate')
   -- Signal that rendering has finished and presentation can happen
   renderFinishedSemaphores <- Vector.replicateM
     (Vector.length swapchainImages)
-    (snd <$> allocate
-      (Vk.createSemaphore device zero Nothing)
-      (flip (Vk.destroySemaphore device) Nothing))
+    (Vk.withSemaphore device zero Nothing allocate')
   -- Ensure only one frame is rendered at a time
   inFlightFences <- Vector.replicateM
     maxFramesInFlight
-    (snd <$> allocate
-      (Vk.createFence device zero{Vk.flags = Vk.FENCE_CREATE_SIGNALED_BIT} Nothing)
-      (flip (Vk.destroyFence device) Nothing))
+    (Vk.withFence device zero{Vk.flags = Vk.FENCE_CREATE_SIGNALED_BIT} Nothing allocate')
   pure (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences)
 
 initVulkan :: Bool -> Int -> Int -> ResIO Application
@@ -625,7 +647,8 @@ initVulkan enableValidationLayers width height = do
     createImageViews swapchainSurfaceFormat swapchainImages device
   graphicsPipeline <- createGraphicsPipeline device swapchainExtent swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
-  (vertexBuffer, vertexBufferMemory) <- createVertexBuffer physicalDevice device
+  (vertexBuffer, vertexBufferMemory) <-
+    createVertexBuffer physicalDevice device commandPool queue
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
     createSyncObjects device swapchainImages
@@ -789,7 +812,7 @@ drawFrame frameIndex = do
       submitInfo = (zero :: Vk.SubmitInfo '[])
         { Vk.waitSemaphores = Vector.singleton frame.presentCompleteSemaphore
         , Vk.waitDstStageMask = Vector.singleton waitDestinationStageMask
-        , Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle $ frame.commandBuffer
+        , Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle frame.commandBuffer
         , Vk.signalSemaphores = renderFinishedSemaphore
         }
     Vk.queueSubmit queue (Vector.singleton $ SomeStruct submitInfo) frame.inFlightFence
