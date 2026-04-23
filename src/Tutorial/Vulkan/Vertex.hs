@@ -4,12 +4,14 @@ module Tutorial.Vulkan.Vertex
   , getAttributeDescriptions
   ) where
 
+import Data.Kind        (Type)
 import Data.Vector      (Vector)
 import Data.Vector      qualified as Vector
 import Linear           qualified as Linear
 import UnliftIO.Foreign (Storable (..), castPtr)
 import Vulkan           qualified as Vk
 
+type Vertex :: Type
 data Vertex = Vertex
   { pos   :: Linear.V2 Float
   , color :: Linear.V3 Float

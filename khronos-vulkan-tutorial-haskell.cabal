@@ -60,7 +60,7 @@ library
       TypeData
       TypeFamilies
       ViewPatterns
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -Wno-ambiguous-fields
+  ghc-options: -Werror -Weverything -Wno-all-missed-specialisations -Wno-ambiguous-fields -Wno-implicit-prelude -Wno-missed-specialisations -Wno-missing-import-lists -Wno-missing-role-annotations -Wno-missing-safe-haskell-mode -Wno-monomorphism-restriction -Wno-unsafe
   c-sources:
       cbits/debug_callback.c
   build-depends:
@@ -72,7 +72,6 @@ library
     , monad-loops
     , mtl
     , resourcet
-    , transformers
     , unliftio
     , vector
     , vulkan
@@ -110,21 +109,10 @@ executable khronos-vulkan-tutorial-haskell-exe
       TypeData
       TypeFamilies
       ViewPatterns
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -Wno-ambiguous-fields -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Werror -Weverything -Wno-all-missed-specialisations -Wno-ambiguous-fields -Wno-implicit-prelude -Wno-missed-specialisations -Wno-missing-import-lists -Wno-missing-role-annotations -Wno-missing-safe-haskell-mode -Wno-monomorphism-restriction -Wno-unsafe -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      GLFW-b
-    , base >=4.7 && <5
-    , bytestring
-    , filepath
+      base >=4.7 && <5
     , khronos-vulkan-tutorial-haskell
-    , linear
-    , monad-loops
-    , mtl
-    , resourcet
-    , transformers
-    , unliftio
-    , vector
-    , vulkan
   default-language: Haskell2010
 
 test-suite khronos-vulkan-tutorial-haskell-test
@@ -160,19 +148,8 @@ test-suite khronos-vulkan-tutorial-haskell-test
       TypeData
       TypeFamilies
       ViewPatterns
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -Wno-ambiguous-fields -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Werror -Weverything -Wno-all-missed-specialisations -Wno-ambiguous-fields -Wno-implicit-prelude -Wno-missed-specialisations -Wno-missing-import-lists -Wno-missing-role-annotations -Wno-missing-safe-haskell-mode -Wno-monomorphism-restriction -Wno-unsafe -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      GLFW-b
-    , base >=4.7 && <5
-    , bytestring
-    , filepath
+      base >=4.7 && <5
     , khronos-vulkan-tutorial-haskell
-    , linear
-    , monad-loops
-    , mtl
-    , resourcet
-    , transformers
-    , unliftio
-    , vector
-    , vulkan
   default-language: Haskell2010

@@ -21,17 +21,6 @@ description:         Please see the README on GitHub at <https://github.com/heit
 
 dependencies:
 - base >= 4.7 && < 5
-- bytestring
-- filepath
-- GLFW-b
-- linear
-- monad-loops
-- mtl
-- resourcet
-- transformers
-- unliftio
-- vector
-- vulkan
 
 default-extensions:
 - BlockArguments
@@ -59,21 +48,33 @@ default-extensions:
 - ViewPatterns
 
 ghc-options:
-- -Wall
-- -Wcompat
-- -Widentities
-- -Wincomplete-record-updates
-- -Wincomplete-uni-patterns
-- -Wmissing-export-lists
-- -Wmissing-home-modules
-- -Wpartial-fields
-- -Wredundant-constraints
+- -Werror
+- -Weverything
+- -Wno-all-missed-specialisations
 - -Wno-ambiguous-fields
+- -Wno-implicit-prelude
+- -Wno-missed-specialisations
+- -Wno-missing-import-lists
+- -Wno-missing-role-annotations
+- -Wno-missing-safe-haskell-mode
+- -Wno-monomorphism-restriction
+- -Wno-unsafe
 
 library:
   source-dirs: src
   c-sources:
   - cbits/debug_callback.c
+  dependencies:
+  - bytestring
+  - filepath
+  - GLFW-b
+  - linear
+  - monad-loops
+  - mtl
+  - resourcet
+  - unliftio
+  - vector
+  - vulkan
 
 executables:
   khronos-vulkan-tutorial-haskell-exe:
