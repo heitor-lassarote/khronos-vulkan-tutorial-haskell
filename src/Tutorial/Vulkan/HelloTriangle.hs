@@ -36,7 +36,7 @@ import Vulkan.Exception             (VulkanException (..))
 import Vulkan.Zero                  (zero)
 
 import Tutorial.Vulkan.Utils        (iFindIndex, iFindIndexM)
-import Tutorial.Vulkan.Vertex       (Vertex (..))
+import Tutorial.Vulkan.Vertex       (Index (..), Vertex (..))
 import Tutorial.Vulkan.Vertex       qualified as Vertex
 import UnliftIO.Foreign             (copyBytes)
 
@@ -75,6 +75,8 @@ data Application = Application
   , framebufferResizedRef    :: IORef Bool
   , vertexBuffer             :: Vk.Buffer
   , vertexBufferMemory       :: Vk.DeviceMemory
+  , indexBuffer              :: Vk.Buffer
+  , indexBufferMemory        :: Vk.DeviceMemory
   }
 
 type MonadApplication :: Type -> Type
@@ -408,9 +410,16 @@ createShaderModule device code = do
 
 vertices :: SVector.Vector Vertex
 vertices = SVector.fromList
-  [ Vertex (Linear.V2  0  -0.5) (Linear.V3 1 0 0)
-  , Vertex (Linear.V2  0.5 0.5) (Linear.V3 0 1 0)
-  , Vertex (Linear.V2 -0.5 0.5) (Linear.V3 0 0 1)
+  [ Vertex (Linear.V2 -0.5 -0.5) (Linear.V3 1 0 0)
+  , Vertex (Linear.V2  0.5 -0.5) (Linear.V3 0 1 0)
+  , Vertex (Linear.V2  0.5  0.5) (Linear.V3 0 0 1)
+  , Vertex (Linear.V2 -0.5  0.5) (Linear.V3 1 1 1)
+  ]
+
+indices :: SVector.Vector Index
+indices = SVector.fromList
+  [ 0, 1, 2
+  , 2, 3, 0
   ]
 
 createGraphicsPipeline ::
@@ -545,10 +554,13 @@ createBuffer physicalDevice device size usage properties = do
 
   pure (bufferReleaseKey, bufferMemoryReleaseKey, buffer, bufferMemory)
 
-createVertexBuffer
-  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
-createVertexBuffer physicalDevice device commandPool graphicsQueue = do
-  let bufferSize = sizeOf (undefined :: Vertex) * SVector.length vertices
+createBuffer'
+  :: forall bufferElem. (Storable bufferElem)
+  => SVector.Vector bufferElem -> Vk.BufferUsageFlags
+  -> Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+createBuffer' inBuffer bufferTypeBit physicalDevice device commandPool graphicsQueue = do
+  let bufferSize = sizeOf (undefined :: bufferElem) * SVector.length inBuffer
 
   (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
     physicalDevice
@@ -557,23 +569,31 @@ createVertexBuffer physicalDevice device commandPool graphicsQueue = do
     Vk.BUFFER_USAGE_TRANSFER_SRC_BIT
     (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
   dataStaging <- Vk.mapMemory device stagingBufferMemory 0 (fromIntegral bufferSize) zero
-  liftIO $ SVector.unsafeWith vertices \ptr ->
+  liftIO $ SVector.unsafeWith inBuffer \ptr ->
     copyBytes (castPtr dataStaging) ptr bufferSize
   Vk.unmapMemory device stagingBufferMemory
 
-  (_vertexBufferReleaseKey, _vertexBufferMemoryReleaseKey, vertexBuffer, vertexBufferMemory) <- createBuffer
+  (_bufferReleaseKey, _bufferMemoryReleaseKey, buffer, bufferMemory) <- createBuffer
     physicalDevice
     device
     (fromIntegral bufferSize)
-    (Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT .|. Vk.BUFFER_USAGE_TRANSFER_DST_BIT)
+    (bufferTypeBit .|. Vk.BUFFER_USAGE_TRANSFER_DST_BIT)
     Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
 
-  copyBuffer device commandPool graphicsQueue stagingBuffer vertexBuffer (fromIntegral bufferSize)
+  copyBuffer device commandPool graphicsQueue stagingBuffer buffer (fromIntegral bufferSize)
 
   release stagingBufferMemoryReleaseKey
   release stagingBufferReleaseKey
 
-  pure (vertexBuffer, vertexBufferMemory)
+  pure (buffer, bufferMemory)
+
+createVertexBuffer
+  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+createVertexBuffer = createBuffer' vertices Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
+
+createIndexBuffer
+  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+createIndexBuffer = createBuffer' indices Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
 
 copyBuffer :: Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize -> ResIO ()
 copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size = do
@@ -649,6 +669,8 @@ initVulkan enableValidationLayers width height = do
   commandPool <- createCommandPool device queueIndex
   (vertexBuffer, vertexBufferMemory) <-
     createVertexBuffer physicalDevice device commandPool queue
+  (indexBuffer, indexBufferMemory) <-
+    createIndexBuffer physicalDevice device commandPool queue
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
     createSyncObjects device swapchainImages
@@ -671,7 +693,7 @@ initVulkan enableValidationLayers width height = do
 
 recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
 recordCommandBuffer imageIndex frame = do
-  Application{swapchainRef, graphicsPipeline, vertexBuffer} <- ask
+  Application{swapchainRef, graphicsPipeline, vertexBuffer, indexBuffer} <- ask
 
   Vk.beginCommandBuffer frame.commandBuffer zero
 
@@ -711,7 +733,8 @@ recordCommandBuffer imageIndex frame = do
       Vk.Viewport 0 0 (fromIntegral swapchain.extent.width) (fromIntegral swapchain.extent.height) 0 1)
   Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapchain.extent))
   Vk.cmdBindVertexBuffers frame.commandBuffer 0 (Vector.singleton vertexBuffer) (Vector.singleton 0)
-  Vk.cmdDraw frame.commandBuffer (fromIntegral $ SVector.length vertices) 1 0 0
+  Vk.cmdBindIndexBuffer frame.commandBuffer indexBuffer 0 Vertex.indexType
+  Vk.cmdDrawIndexed frame.commandBuffer (fromIntegral $ SVector.length indices) 1 0 0 0
 
   Vk.cmdEndRendering frame.commandBuffer
 

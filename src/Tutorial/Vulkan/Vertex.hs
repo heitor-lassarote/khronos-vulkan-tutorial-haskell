@@ -1,5 +1,7 @@
 module Tutorial.Vulkan.Vertex
   ( Vertex (..)
+  , Index (..)
+  , indexType
   , getBindingDescription
   , getAttributeDescriptions
   ) where
@@ -7,6 +9,7 @@ module Tutorial.Vulkan.Vertex
 import Data.Kind        (Type)
 import Data.Vector      (Vector)
 import Data.Vector      qualified as Vector
+import Data.Word        (Word16)
 import Linear           qualified as Linear
 import UnliftIO.Foreign (Storable (..), castPtr)
 import Vulkan           qualified as Vk
@@ -16,6 +19,13 @@ data Vertex = Vertex
   { pos   :: Linear.V2 Float
   , color :: Linear.V3 Float
   }
+
+type Index :: Type
+newtype Index = Index{index :: Word16}
+  deriving newtype (Num, Storable)
+
+indexType :: Vk.IndexType
+indexType = Vk.INDEX_TYPE_UINT16
 
 instance Storable Vertex where
   sizeOf _ =
