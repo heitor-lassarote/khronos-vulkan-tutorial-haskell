@@ -24,6 +24,7 @@ dependencies:
 - bytestring
 - filepath
 - GLFW-b
+- linear
 - monad-loops
 - mtl
 - resourcet
@@ -41,6 +42,7 @@ default-extensions:
 - GeneralizedNewtypeDeriving
 - ImportQualifiedPost
 - LambdaCase
+- LexicalNegation
 - MultiParamTypeClasses
 - NamedFieldPuns
 - NoFieldSelectors
@@ -66,6 +68,7 @@ ghc-options:
 - -Wmissing-home-modules
 - -Wpartial-fields
 - -Wredundant-constraints
+- -Wno-ambiguous-fields
 
 library:
   source-dirs: src

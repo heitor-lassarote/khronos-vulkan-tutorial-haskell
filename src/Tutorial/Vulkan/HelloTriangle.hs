@@ -7,7 +7,7 @@ import Control.Monad.Reader         (MonadReader (..), ReaderT (..))
 import Control.Monad.Trans          (lift)
 import Control.Monad.Trans.Resource
   (MonadResource, ReleaseKey, ResIO, allocate, allocate_, release, runResourceT)
-import Data.Bits                    (shift, zeroBits, (.&.), (.|.))
+import Data.Bits                    (Bits (..))
 import Data.ByteString.Char8        (ByteString)
 import Data.ByteString.Char8        qualified as BS
 import Data.Foldable                (find, for_, traverse_)
@@ -17,8 +17,11 @@ import Data.Maybe                   (fromJust, fromMaybe, isJust)
 import Data.Ord                     (clamp)
 import Data.Vector                  (Vector)
 import Data.Vector                  qualified as Vector
+import Data.Vector.Storable         qualified as SVector
 import Data.Word                    (Word32)
+import Foreign                      (castPtr)
 import Graphics.UI.GLFW             qualified as GLFW
+import Linear                       qualified as Linear
 import System.FilePath              ((<.>), (</>))
 import System.IO                    (hPutStrLn, stderr)
 import UnliftIO                     (IORef, MonadUnliftIO)
@@ -31,6 +34,11 @@ import Vulkan                       qualified as Vk
 import Vulkan.CStruct.Extends       (SomeStruct (..), pattern (:&))
 import Vulkan.Exception             (VulkanException (..))
 import Vulkan.Zero                  (zero)
+
+import Tutorial.Vulkan.Utils        (iFindIndex, iFindIndexM)
+import Tutorial.Vulkan.Vertex       (Vertex (..))
+import Tutorial.Vulkan.Vertex       qualified as Vertex
+import UnliftIO.Foreign             (copyBytes)
 
 foreign import ccall unsafe "debug_callback.c &debug_callback"
   debugCallbackPtr :: Vk.PFN_vkDebugUtilsMessengerCallbackEXT
@@ -65,6 +73,8 @@ data Application = Application
   , renderFinishedSemaphores :: Vector Vk.Semaphore
   , graphicsPipeline         :: Vk.Pipeline
   , framebufferResizedRef    :: IORef Bool
+  , vertexBuffer             :: Vk.Buffer
+  , vertexBufferMemory       :: Vk.DeviceMemory
   }
 
 type MonadApplication :: Type -> Type
@@ -240,16 +250,6 @@ pickPhysicalDevice inst = do
     throwIO $ RuntimeError "failed to find a suitable GPU!"
   Vector.headM devices
 
-iFindIndexM :: (Monad m) => (Int -> a -> m Bool) -> Vector a -> m (Maybe Int)
-iFindIndexM predicate v = go 0
- where
-  len = Vector.length v
-  go i
-    | i == len  = pure Nothing
-    | otherwise = predicate i (Vector.unsafeIndex v i) >>= \case
-        False -> go $ i + 1
-        True  -> pure $ Just i
-
 createLogicalDevice :: Vk.PhysicalDevice -> Vk.SurfaceKHR -> ResIO (Vk.Device, Vk.Queue, Word32)
 createLogicalDevice physicalDevice surface = do
   queueFamilyProperties <- Vk.getPhysicalDeviceQueueFamilyProperties physicalDevice
@@ -411,6 +411,13 @@ createShaderModule device code = do
     (Vk.createShaderModule device createInfo Nothing)
     (flip (Vk.destroyShaderModule device) Nothing)
 
+vertices :: SVector.Vector Vertex
+vertices = SVector.fromList
+  [ Vertex (Linear.V2  0  -0.5) (Linear.V3 1 0 0)
+  , Vertex (Linear.V2  0.5 0.5) (Linear.V3 0 1 0)
+  , Vertex (Linear.V2 -0.5 0.5) (Linear.V3 0 0 1)
+  ]
+
 createGraphicsPipeline ::
   Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR -> ResIO Vk.Pipeline
 createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
@@ -432,7 +439,11 @@ createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
     dynamicStates = Vector.fromList [Vk.DYNAMIC_STATE_VIEWPORT, Vk.DYNAMIC_STATE_SCISSOR]
     dynamicState = (zero :: Vk.PipelineDynamicStateCreateInfo){Vk.dynamicStates}
 
-    vertexInputInfo = zero :: Vk.PipelineVertexInputStateCreateInfo '[]
+    vertexInputInfo = (zero :: Vk.PipelineVertexInputStateCreateInfo '[])
+      { Vk.vertexBindingDescriptions = Vector.singleton Vertex.getBindingDescription
+      , Vk.vertexAttributeDescriptions = Vertex.getAttributeDescriptions
+      }
+
     inputAssemblyState = (zero :: Vk.PipelineInputAssemblyStateCreateInfo)
       { Vk.topology = Vk.PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
       }
@@ -517,6 +528,65 @@ createCommandPool device queueIndex = do
     (Vk.createCommandPool device poolInfo Nothing)
     (flip (Vk.destroyCommandPool device) Nothing)
 
+createVertexBuffer :: Vk.PhysicalDevice -> Vk.Device -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+createVertexBuffer physicalDevice device = do
+  let
+    verticesSize = sizeOf (undefined :: Vertex) * SVector.length vertices
+    bufferInfo = (zero :: Vk.BufferCreateInfo '[])
+      { Vk.size = fromIntegral verticesSize
+      , Vk.usage = Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
+      , Vk.sharingMode = Vk.SHARING_MODE_EXCLUSIVE
+      }
+  (_vertexBufferReleaseKey, vertexBuffer) <- allocate
+    (Vk.createBuffer device bufferInfo Nothing)
+    (flip (Vk.destroyBuffer device) Nothing)
+
+  memRequirements <- Vk.getBufferMemoryRequirements device vertexBuffer
+  memTypeIndex <- findMemoryType
+    physicalDevice
+    memRequirements.memoryTypeBits
+    (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+  let
+    memoryAllocateInfo = (zero :: Vk.MemoryAllocateInfo '[])
+      { Vk.allocationSize = memRequirements.size
+      , Vk.memoryTypeIndex = memTypeIndex
+      }
+  (_vertexBufferMemoryReleaseKey, vertexBufferMemory) <- allocate
+    (Vk.allocateMemory device memoryAllocateInfo Nothing)
+    (flip (Vk.freeMemory device) Nothing)
+
+  Vk.bindBufferMemory device vertexBuffer vertexBufferMemory 0
+  data' <- Vk.mapMemory device vertexBufferMemory 0 bufferInfo.size zero
+  liftIO $ SVector.unsafeWith vertices \ptr ->
+    copyBytes (castPtr data') ptr verticesSize
+  Vk.unmapMemory device vertexBufferMemory
+
+  pure (vertexBuffer, vertexBufferMemory)
+
+findMemoryType :: (MonadIO io) => Vk.PhysicalDevice -> Word32 -> Vk.MemoryPropertyFlags -> io Word32
+findMemoryType physicalDevice typeFilter properties = do
+  memProperties <- Vk.getPhysicalDeviceMemoryProperties physicalDevice
+  let
+    memTypeMb = iFindIndex
+      (\i memType ->
+        testBit typeFilter i && (Vk.propertyFlags memType .&. properties) == properties)
+      (Vk.memoryTypes memProperties)
+  case memTypeMb of
+    Nothing -> throwIO $ RuntimeError "Failed to find suitable memory type!"
+    Just memType -> pure $ fromIntegral memType
+
+createCommandBuffers :: Vk.Device -> Vk.CommandPool -> ResIO (Vector Vk.CommandBuffer)
+createCommandBuffers device commandPool = do
+  let
+    allocInfo = (zero :: Vk.CommandBufferAllocateInfo)
+      { Vk.commandPool
+      , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
+      , Vk.commandBufferCount = fromIntegral maxFramesInFlight
+      }
+  snd <$> allocate
+    (Vk.allocateCommandBuffers device allocInfo)
+    (Vk.freeCommandBuffers device commandPool)
+
 createSyncObjects
   :: Vk.Device -> Vector Vk.Image -> ResIO (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
 createSyncObjects device swapchainImages = do
@@ -555,6 +625,7 @@ initVulkan enableValidationLayers width height = do
     createImageViews swapchainSurfaceFormat swapchainImages device
   graphicsPipeline <- createGraphicsPipeline device swapchainExtent swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
+  (vertexBuffer, vertexBufferMemory) <- createVertexBuffer physicalDevice device
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
     createSyncObjects device swapchainImages
@@ -575,24 +646,9 @@ initVulkan enableValidationLayers width height = do
     }
   pure Application{..}
 
-createCommandBuffers :: Vk.Device -> Vk.CommandPool -> ResIO (Vector Vk.CommandBuffer)
-createCommandBuffers device commandPool = do
-  let
-    allocInfo = (zero :: Vk.CommandBufferAllocateInfo)
-      { Vk.commandPool
-      , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
-      , Vk.commandBufferCount = fromIntegral maxFramesInFlight
-      }
-  snd <$> allocate
-    (Vk.allocateCommandBuffers device allocInfo)
-    (Vk.freeCommandBuffers device commandPool)
-
 recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
 recordCommandBuffer imageIndex frame = do
-  Application
-    { swapchainRef
-    , graphicsPipeline
-    } <- ask
+  Application{swapchainRef, graphicsPipeline, vertexBuffer} <- ask
 
   Vk.beginCommandBuffer frame.commandBuffer zero
 
@@ -631,7 +687,8 @@ recordCommandBuffer imageIndex frame = do
     (Vector.singleton $
       Vk.Viewport 0 0 (fromIntegral swapchain.extent.width) (fromIntegral swapchain.extent.height) 0 1)
   Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapchain.extent))
-  Vk.cmdDraw frame.commandBuffer 3 1 0 0
+  Vk.cmdBindVertexBuffers frame.commandBuffer 0 (Vector.singleton vertexBuffer) (Vector.singleton 0)
+  Vk.cmdDraw frame.commandBuffer (fromIntegral $ SVector.length vertices) 1 0 0
 
   Vk.cmdEndRendering frame.commandBuffer
 

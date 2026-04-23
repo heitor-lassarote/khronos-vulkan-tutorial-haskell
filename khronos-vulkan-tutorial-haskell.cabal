@@ -28,6 +28,8 @@ source-repository head
 library
   exposed-modules:
       Tutorial.Vulkan.HelloTriangle
+      Tutorial.Vulkan.Utils
+      Tutorial.Vulkan.Vertex
   other-modules:
       Paths_khronos_vulkan_tutorial_haskell
   autogen-modules:
@@ -43,6 +45,7 @@ library
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
+      LexicalNegation
       MultiParamTypeClasses
       NamedFieldPuns
       NoFieldSelectors
@@ -57,7 +60,7 @@ library
       TypeData
       TypeFamilies
       ViewPatterns
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -Wno-ambiguous-fields
   c-sources:
       cbits/debug_callback.c
   build-depends:
@@ -65,6 +68,7 @@ library
     , base >=4.7 && <5
     , bytestring
     , filepath
+    , linear
     , monad-loops
     , mtl
     , resourcet
@@ -91,6 +95,7 @@ executable khronos-vulkan-tutorial-haskell-exe
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
+      LexicalNegation
       MultiParamTypeClasses
       NamedFieldPuns
       NoFieldSelectors
@@ -105,13 +110,14 @@ executable khronos-vulkan-tutorial-haskell-exe
       TypeData
       TypeFamilies
       ViewPatterns
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -Wno-ambiguous-fields -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       GLFW-b
     , base >=4.7 && <5
     , bytestring
     , filepath
     , khronos-vulkan-tutorial-haskell
+    , linear
     , monad-loops
     , mtl
     , resourcet
@@ -139,6 +145,7 @@ test-suite khronos-vulkan-tutorial-haskell-test
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
+      LexicalNegation
       MultiParamTypeClasses
       NamedFieldPuns
       NoFieldSelectors
@@ -153,13 +160,14 @@ test-suite khronos-vulkan-tutorial-haskell-test
       TypeData
       TypeFamilies
       ViewPatterns
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -Wno-ambiguous-fields -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       GLFW-b
     , base >=4.7 && <5
     , bytestring
     , filepath
     , khronos-vulkan-tutorial-haskell
+    , linear
     , monad-loops
     , mtl
     , resourcet
