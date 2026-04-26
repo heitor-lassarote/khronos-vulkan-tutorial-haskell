@@ -68,10 +68,12 @@ library
     , base >=4.7 && <5
     , bytestring
     , filepath
+    , lens
     , linear
     , monad-loops
     , mtl
     , resourcet
+    , time
     , unliftio
     , vector
     , vulkan

@@ -68,10 +68,12 @@ library:
   - bytestring
   - filepath
   - GLFW-b
+  - lens
   - linear
   - monad-loops
   - mtl
   - resourcet
+  - time
   - unliftio
   - vector
   - vulkan

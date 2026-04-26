@@ -1,5 +1,6 @@
 module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 
+import Control.Lens                 (_1, view, (%~), (&))
 import Control.Monad                (unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
@@ -15,6 +16,8 @@ import Data.Functor                 ((<&>))
 import Data.Kind                    (Type)
 import Data.Maybe                   (fromJust, fromMaybe, isJust)
 import Data.Ord                     (clamp)
+import Data.Time                    (UTCTime)
+import Data.Time                    qualified as Time
 import Data.Vector                  (Vector)
 import Data.Vector                  qualified as Vector
 import Data.Vector.Storable         qualified as SVector
@@ -28,7 +31,7 @@ import UnliftIO                     (IORef, MonadUnliftIO)
 import UnliftIO.Exception
   (Exception (displayException), SomeException, assert, catch, finally, throwIO)
 import UnliftIO.Foreign
-  (Storable (..), alloca, nullPtr, peekCString)
+  (Ptr, Storable (..), alloca, copyBytes, nullPtr, peekCString)
 import UnliftIO.IORef               (newIORef, readIORef, writeIORef)
 import Vulkan                       qualified as Vk
 import Vulkan.CStruct.Extends       (SomeStruct (..), pattern (:&))
@@ -38,7 +41,6 @@ import Vulkan.Zero                  (zero)
 import Tutorial.Vulkan.Utils        (iFindIndex, iFindIndexM)
 import Tutorial.Vulkan.Vertex       (Index (..), Vertex (..))
 import Tutorial.Vulkan.Vertex       qualified as Vertex
-import UnliftIO.Foreign             (copyBytes)
 
 foreign import ccall unsafe "debug_callback.c &debug_callback"
   debugCallbackPtr :: Vk.PFN_vkDebugUtilsMessengerCallbackEXT
@@ -48,6 +50,10 @@ data Frame = Frame
   { presentCompleteSemaphore :: Vk.Semaphore
   , inFlightFence            :: Vk.Fence
   , commandBuffer            :: Vk.CommandBuffer
+  , uniformBuffer            :: Vk.Buffer
+  , uniformBufferMemory      :: Vk.DeviceMemory
+  , uniformBufferMapped      :: Ptr UniformBufferObject
+  , descriptorSet            :: Vk.DescriptorSet
   }
 
 type Swapchain :: Type
@@ -61,6 +67,29 @@ data Swapchain = Swapchain
   , imageViewsReleaseKeys :: Vector ReleaseKey
   }
 
+type UniformBufferObject :: Type
+data UniformBufferObject = UniformBufferObject
+  { model, view, proj :: Linear.M44 Float
+  }
+
+instance Storable UniformBufferObject where
+  sizeOf _ = 3 * sizeOf (undefined :: Linear.M44 Float)
+
+  alignment _ = alignment (undefined :: Float)
+
+  peek ptr = do
+    let p = castPtr ptr
+    model <- peek p
+    view' <- peekByteOff p (sizeOf (undefined :: Linear.M44 Float))
+    proj <- peekByteOff p (2 * sizeOf (undefined :: Linear.M44 Float))
+    pure UniformBufferObject{view = view', ..}
+
+  poke ptr UniformBufferObject{view = view', ..} = do
+    let p = castPtr ptr
+    poke p model
+    pokeByteOff p (sizeOf (undefined :: Linear.M44 Float)) view'
+    pokeByteOff p (2 * sizeOf (undefined :: Linear.M44 Float)) proj
+
 type Application :: Type
 data Application = Application
   { window                   :: GLFW.Window
@@ -71,12 +100,15 @@ data Application = Application
   , queue                    :: Vk.Queue
   , swapchainRef             :: IORef Swapchain
   , renderFinishedSemaphores :: Vector Vk.Semaphore
+  , descriptorSetLayout      :: Vk.DescriptorSetLayout
+  , pipelineLayout           :: Vk.PipelineLayout
   , graphicsPipeline         :: Vk.Pipeline
   , framebufferResizedRef    :: IORef Bool
   , vertexBuffer             :: Vk.Buffer
   , vertexBufferMemory       :: Vk.DeviceMemory
   , indexBuffer              :: Vk.Buffer
   , indexBufferMemory        :: Vk.DeviceMemory
+  , startTime                :: UTCTime
   }
 
 type MonadApplication :: Type -> Type
@@ -401,6 +433,21 @@ createImageViews swapchainSurfaceFormat swapchainImages device = do
       (flip (Vk.destroyImageView device) Nothing))
     swapchainImages
 
+createDescriptorSetLayout :: Vk.Device -> ResIO Vk.DescriptorSetLayout
+createDescriptorSetLayout device = do
+  let
+    uboLayoutBinding = Vk.DescriptorSetLayoutBinding
+      { Vk.binding = 0
+      , Vk.descriptorType = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
+      , Vk.descriptorCount = 1
+      , Vk.stageFlags = Vk.SHADER_STAGE_VERTEX_BIT
+      , Vk.immutableSamplers = Vector.empty
+      }
+    layoutInfo = (zero :: Vk.DescriptorSetLayoutCreateInfo '[])
+      { Vk.bindings = Vector.singleton uboLayoutBinding
+      }
+  Vk.withDescriptorSetLayout device layoutInfo Nothing allocate'
+
 createShaderModule :: Vk.Device -> ByteString -> ResIO (ReleaseKey, Vk.ShaderModule)
 createShaderModule device code = do
   let createInfo = (zero :: Vk.ShaderModuleCreateInfo '[]){Vk.code}
@@ -422,9 +469,10 @@ indices = SVector.fromList
   , 2, 3, 0
   ]
 
-createGraphicsPipeline ::
-  Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR -> ResIO Vk.Pipeline
-createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
+createGraphicsPipeline
+  :: Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
+  -> ResIO (Vk.PipelineLayout, Vk.Pipeline)
+createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
   let
@@ -462,7 +510,7 @@ createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
       , Vk.rasterizerDiscardEnable = False
       , Vk.polygonMode = Vk.POLYGON_MODE_FILL
       , Vk.cullMode = Vk.CULL_MODE_BACK_BIT
-      , Vk.frontFace = Vk.FRONT_FACE_CLOCKWISE
+      , Vk.frontFace = Vk.FRONT_FACE_COUNTER_CLOCKWISE
       , Vk.depthBiasEnable = False
       , Vk.lineWidth = 1
       }
@@ -485,7 +533,10 @@ createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
       , Vk.attachments = Vector.singleton colorBlendAttachment
       }
 
-    pipelineLayoutInfo = zero :: Vk.PipelineLayoutCreateInfo
+    pipelineLayoutInfo = (zero :: Vk.PipelineLayoutCreateInfo)
+      { Vk.setLayouts = Vector.singleton descriptorSetLayout
+      , Vk.pushConstantRanges = Vector.empty
+      }
   pipelineLayout <- Vk.withPipelineLayout device pipelineLayoutInfo Nothing allocate'
 
   let
@@ -514,7 +565,7 @@ createGraphicsPipeline device _swapchainExtent swapchainSurfaceFormat = do
 
   release shaderModuleKey
 
-  pure graphicsPipeline
+  pure (pipelineLayout, graphicsPipeline)
 
 createCommandPool :: Vk.Device -> Word32 -> ResIO Vk.CommandPool
 createCommandPool device queueIndex = do
@@ -595,6 +646,65 @@ createIndexBuffer
   :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
 createIndexBuffer = createBuffer' indices Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
 
+createUniformBuffers
+  :: Vk.PhysicalDevice -> Vk.Device -> ResIO (Vector (Vk.Buffer, Vk.DeviceMemory, Ptr UniformBufferObject))
+createUniformBuffers physicalDevice device = do
+  Vector.replicateM maxFramesInFlight do
+    let bufferSize = sizeOf (undefined :: UniformBufferObject)
+    (_bufferReleaseKey, _bufferMemoryReleaseKey, buffer, bufferMemory) <- createBuffer
+      physicalDevice
+      device
+      (fromIntegral bufferSize)
+      Vk.BUFFER_USAGE_UNIFORM_BUFFER_BIT
+      (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    uniformBufferMapped <- Vk.mapMemory device bufferMemory 0 (fromIntegral bufferSize) zero
+    pure (buffer, bufferMemory, castPtr uniformBufferMapped)
+
+createDescriptorPool :: Vk.Device -> ResIO Vk.DescriptorPool
+createDescriptorPool device = do
+  let
+    poolSize = Vk.DescriptorPoolSize
+      { Vk.type' = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
+      , Vk.descriptorCount = fromIntegral maxFramesInFlight
+      }
+    poolInfo = (zero :: Vk.DescriptorPoolCreateInfo '[])
+      { Vk.flags = Vk.DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
+      , Vk.maxSets = fromIntegral maxFramesInFlight
+      , Vk.poolSizes = Vector.singleton poolSize
+      }
+  Vk.withDescriptorPool device poolInfo Nothing allocate'
+
+createDescriptorSets
+  :: Vk.Device -> Vk.DescriptorPool -> Vk.DescriptorSetLayout -> Vector Vk.Buffer
+  -> ResIO (Vector Vk.DescriptorSet)
+createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers = do
+  let
+    layouts = Vector.replicate maxFramesInFlight descriptorSetLayout
+    allocInfo = (zero :: Vk.DescriptorSetAllocateInfo '[])
+      { Vk.descriptorPool
+      , Vk.setLayouts = layouts
+      }
+  descriptorSets <- Vk.withDescriptorSets device allocInfo allocate'
+
+  for_ (Vector.zip descriptorSets uniformBuffers) \(descriptorSet, uniformBuffer) -> do
+    let
+      bufferInfo = Vk.DescriptorBufferInfo
+        { Vk.buffer = uniformBuffer
+        , Vk.offset = 0
+        , Vk.range = fromIntegral $ sizeOf (undefined :: UniformBufferObject)
+        }
+      descriptorWrite = (zero :: Vk.WriteDescriptorSet '[])
+        { Vk.dstSet = descriptorSet
+        , Vk.dstBinding = 0
+        , Vk.dstArrayElement = 0
+        , Vk.descriptorCount = 1
+        , Vk.descriptorType = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
+        , Vk.bufferInfo = Vector.singleton bufferInfo
+        }
+    Vk.updateDescriptorSets device (Vector.singleton $ SomeStruct descriptorWrite) Vector.empty
+
+  pure descriptorSets
+
 copyBuffer :: Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize -> ResIO ()
 copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size = do
   let
@@ -654,6 +764,7 @@ createSyncObjects device swapchainImages = do
 
 initVulkan :: Bool -> Int -> Int -> ResIO Application
 initVulkan enableValidationLayers width height = do
+  startTime <- liftIO Time.getCurrentTime
   framebufferResizedRef <- newIORef False
   window <- initWindow width height framebufferResizedRef
   inst <- createInstance enableValidationLayers
@@ -665,21 +776,34 @@ initVulkan enableValidationLayers width height = do
     createSwapchain device physicalDevice surface window
   (swapchainImageViewsReleaseKeys, swapchainImageViews) <-
     createImageViews swapchainSurfaceFormat swapchainImages device
-  graphicsPipeline <- createGraphicsPipeline device swapchainExtent swapchainSurfaceFormat
+  descriptorSetLayout <- createDescriptorSetLayout device
+  (pipelineLayout, graphicsPipeline) <-
+    createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
   (vertexBuffer, vertexBufferMemory) <-
     createVertexBuffer physicalDevice device commandPool queue
   (indexBuffer, indexBufferMemory) <-
     createIndexBuffer physicalDevice device commandPool queue
+  uniformBuffers <- createUniformBuffers physicalDevice device
+  descriptorPool <- createDescriptorPool device
+  descriptorSets <- do
+    let uniformBuffers' = fmap (view _1) uniformBuffers
+    createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers'
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
     createSyncObjects device swapchainImages
   let
-    frames = Vector.zipWith3
-      (\presentCompleteSemaphore inFlightFence commandBuffer -> Frame{..})
+    frames = Vector.zipWith5
+      (\presentCompleteSemaphore
+        inFlightFence
+        commandBuffer
+        (uniformBuffer, uniformBufferMemory, uniformBufferMapped)
+        descriptorSet -> Frame{..})
       presentCompleteSemaphores
       inFlightFences
       commandBuffers
+      uniformBuffers
+      descriptorSets
   swapchainRef <- newIORef Swapchain
     { swapchain
     , surfaceFormat = swapchainSurfaceFormat
@@ -693,7 +817,7 @@ initVulkan enableValidationLayers width height = do
 
 recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
 recordCommandBuffer imageIndex frame = do
-  Application{swapchainRef, graphicsPipeline, vertexBuffer, indexBuffer} <- ask
+  Application{..} <- ask
 
   Vk.beginCommandBuffer frame.commandBuffer zero
 
@@ -734,6 +858,13 @@ recordCommandBuffer imageIndex frame = do
   Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapchain.extent))
   Vk.cmdBindVertexBuffers frame.commandBuffer 0 (Vector.singleton vertexBuffer) (Vector.singleton 0)
   Vk.cmdBindIndexBuffer frame.commandBuffer indexBuffer 0 Vertex.indexType
+  Vk.cmdBindDescriptorSets
+    frame.commandBuffer
+    Vk.PIPELINE_BIND_POINT_GRAPHICS
+    pipelineLayout
+    0
+    (Vector.singleton frame.descriptorSet)
+    Vector.empty
   Vk.cmdDrawIndexed frame.commandBuffer (fromIntegral $ SVector.length indices) 1 0 0 0
 
   Vk.cmdEndRendering frame.commandBuffer
@@ -824,6 +955,8 @@ drawFrame frameIndex = do
   continue drawFences imageIndex frame swapchain = do
     Application{..} <- ask
 
+    updateUniformBuffer frame
+
     -- Only reset the fence if we are submitting work
     Vk.resetFences device drawFences
 
@@ -863,6 +996,27 @@ drawFrame frameIndex = do
           pure $ assert (result == Vk.SUCCESS) ()
 
     pure True
+
+updateUniformBuffer :: Frame -> MonadApplication ()
+updateUniformBuffer frame = do
+  Application{startTime, swapchainRef} <- ask
+  currentTime <- liftIO Time.getCurrentTime
+  swapchain <- readIORef swapchainRef
+  let
+    time = realToFrac $ Time.diffUTCTime currentTime startTime
+    model = Linear.transpose $ Linear.mkTransformation
+      (Linear.axisAngle (Linear.V3 0 0 1) (time * pi / 2))
+      (Linear.V3 0 0 0)
+    view' = Linear.transpose $ Linear.lookAt (Linear.V3 2 2 2) (Linear.V3 0 0 0) (Linear.V3 0 0 1)
+    projFlipped = Linear.transpose $ Linear.perspective
+      (pi / 4)
+      (realToFrac swapchain.extent.width / realToFrac swapchain.extent.height)
+      0.1
+      10
+    -- We negate the y coordinate's scaling factor because Vulkan's y axis points down.
+    proj = projFlipped & Linear._y . Linear._y %~ negate
+    ubo = UniformBufferObject{view = view', ..}
+  liftIO $ poke frame.uniformBufferMapped ubo
 
 catchOutOfDate :: (MonadUnliftIO m) => m Vk.Result -> m Vk.Result
 catchOutOfDate action =
