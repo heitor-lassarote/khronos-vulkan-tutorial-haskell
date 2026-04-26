@@ -126,27 +126,37 @@ newtype RuntimeError = RuntimeError String
   deriving stock (Eq, Show)
   deriving anyclass (Exception)
 
+-- | Throws a runtime error if the provided result is anything other than a success.
 checkResult :: (MonadIO io) => String -> Vk.Result -> io ()
 checkResult _ Vk.SUCCESS = pure ()
 checkResult message result =
   throwIO $ RuntimeError $ "[" <> show result <> "] " <> message
 
+-- | Perform an action and possibly throw an exception with 'checkResult'.
 withResultCheck :: (MonadIO io) => String -> io (Vk.Result, a) -> io a
 withResultCheck msg action = do
   (result, ret) <- action
   checkResult msg result
   pure ret
 
-defaultWidth, defaultHeight :: Int
+-- | The default window width.
+defaultWidth :: Int
 defaultWidth = 800
+
+-- | The default window height.
+defaultHeight :: Int
 defaultHeight = 600
 
+-- | Maximum allowed frames in flight.
 maxFramesInFlight :: Int
 maxFramesInFlight = 2
 
+-- | Allocates memory with @resourcet@'s 'allocate', discarding the release key.
 allocate' :: IO a -> (a -> IO ()) -> ResIO a
 allocate' create destroy = snd <$> allocate create destroy
 
+-- | Initializes the GLFW window with the provided width and height.
+-- The bool reference is set to 'True' if the window is resized with GLFW's resize callback.
 initWindow :: Int -> Int -> IORef Bool -> ResIO GLFW.Window
 initWindow width height framebufferResizedRef = do
   _glfwKeyReleaseKey <- allocate_ GLFW.init GLFW.terminate
@@ -164,9 +174,11 @@ initWindow width height framebufferResizedRef = do
 
   pure window
 
+-- | Wraps the provided major, minor, and patch values with Vulkan's expected version format.
 makeVersion :: Word32 -> Word32 -> Word32 -> Word32
 makeVersion major minor patch = major `shift` 22 .|. minor `shift` 12 .|. patch
 
+-- | Enumerates the required Vulkan extensions from GLFW and optionally the validation layer.
 getRequiredInstanceExtensions :: Bool -> IO (Vector ByteString)
 getRequiredInstanceExtensions enableValidationLayers = do
   glfwExtensions <-
@@ -181,6 +193,7 @@ getRequiredInstanceExtensions enableValidationLayers = do
 
   pure $ (if enableValidationLayers then Vector.cons Vk.EXT_DEBUG_UTILS_EXTENSION_NAME else id) glfwExtensions
 
+-- | Creates a Vulkan instance, optionally enabling the validation layer.
 createInstance :: Bool -> ResIO Vk.Instance
 createInstance enableValidationLayers = do
   when enableValidationLayers do
@@ -212,6 +225,7 @@ createInstance enableValidationLayers = do
     | enableValidationLayers = Vector.singleton "VK_LAYER_KHRONOS_validation"
     | otherwise              = Vector.empty
 
+-- | Optionally registers a debug messenger. See 'debugCallbackPtr'.
 setupDebugMessenger :: Bool -> Vk.Instance -> ResIO (Maybe Vk.DebugUtilsMessengerEXT)
 setupDebugMessenger enableValidationLayers inst =
   if enableValidationLayers then do
@@ -234,6 +248,15 @@ setupDebugMessenger enableValidationLayers inst =
     .|. Vk.DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT
     .|. Vk.DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
 
+-- | Picks the first physical device (GPU) that supports:
+--
+--     1. Vulkan API 1.3 or greater.
+--     2. Graphics queues.
+--     3. The swapchain extension.
+--     4. Shaders.
+--     5. Dynamic rendering.
+--     6. @synchronization2@.
+--     7. Extended dynamic state.
 pickPhysicalDevice :: Vk.Instance -> IO Vk.PhysicalDevice
 pickPhysicalDevice inst = do
   physicalDevices <-
@@ -281,6 +304,9 @@ pickPhysicalDevice inst = do
     throwIO $ RuntimeError "failed to find a suitable GPU!"
   Vector.headM devices
 
+-- | Creates a logical device that supports all capabilities from 'pickPhysicalDevice'.
+--
+-- This function also retrieves the graphics+present queue and its index.
 createLogicalDevice :: Vk.PhysicalDevice -> Vk.SurfaceKHR -> ResIO (Vk.Device, Vk.Queue, Word32)
 createLogicalDevice physicalDevice surface = do
   queueFamilyProperties <- Vk.getPhysicalDeviceQueueFamilyProperties physicalDevice
@@ -324,6 +350,7 @@ createLogicalDevice physicalDevice surface = do
   graphicsQueue <- Vk.getDeviceQueue device (fromIntegral graphicsIndex) queueIndex
   pure (device, graphicsQueue, queueIndex)
 
+-- | Uses GLFW to create a Vulkan surface.
 createSurface :: Vk.Instance -> GLFW.Window -> ResIO Vk.SurfaceKHR
 createSurface inst window = do
   allocate'
@@ -333,6 +360,7 @@ createSurface inst window = do
         r -> throwIO $ RuntimeError $ "Failed to create window surface: " <> show r)
     (flip (Vk.destroySurfaceKHR inst) Nothing)
 
+-- | Picks the first format supporting B8G8R8A8 non-linear SRGB.
 chooseSwapSurfaceFormat :: Vector Vk.SurfaceFormatKHR -> Vk.SurfaceFormatKHR
 chooseSwapSurfaceFormat availableFormats = assert
   (not $ Vector.null availableFormats)
@@ -342,6 +370,7 @@ chooseSwapSurfaceFormat availableFormats = assert
     (\format -> format.format == Vk.FORMAT_B8G8R8A8_SRGB && format.colorSpace == Vk.COLOR_SPACE_SRGB_NONLINEAR_KHR)
     availableFormats
 
+-- | Prefers mailbox (triple-buffering), fallbacks to FIFO (vsync) otherwise.
 chooseSwapPresentMode :: Vector Vk.PresentModeKHR -> Vk.PresentModeKHR
 chooseSwapPresentMode availablePresentModes = assert
   (fifo `elem` availablePresentModes)
@@ -350,6 +379,8 @@ chooseSwapPresentMode availablePresentModes = assert
   mailbox = Vk.PRESENT_MODE_MAILBOX_KHR
   fifo = Vk.PRESENT_MODE_FIFO_KHR
 
+-- | Uses the swap's current extend if present.
+-- Otherwise, clamps the framebuffer's extent (queried via GLFW) between the surface's minimum and maximum.
 chooseSwapExtent :: (MonadIO io) => Vk.SurfaceCapabilitiesKHR -> GLFW.Window -> io Vk.Extent2D
 chooseSwapExtent capabilities window
   | capabilities.currentExtent.width /= maxBound = pure capabilities.currentExtent
@@ -360,6 +391,7 @@ chooseSwapExtent capabilities window
       , height = clamp (capabilities.minImageExtent.height, capabilities.maxImageExtent.height) height
       }
 
+-- | Requests at least 3 images, capped at the surface's maximum, if there is one.
 chooseSwapMinImageCount :: Vk.SurfaceCapabilitiesKHR -> Word32
 chooseSwapMinImageCount capabilities
   -- 0 means that there is no maximum
@@ -368,6 +400,9 @@ chooseSwapMinImageCount capabilities
  where
   minImageCount = max 3 capabilities.minImageCount
 
+-- | Creates the swapchain alongside its release key (managed by 'recreateSwapchain').
+--
+-- Also returns the swapchain images, format, and extent.
 createSwapchain
   :: Vk.Device
   -> Vk.PhysicalDevice
@@ -409,6 +444,9 @@ createSwapchain device physicalDevice surface window = do
       Vk.getSwapchainImagesKHR device swapchain
   pure (swapchainReleaseKey, swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent)
 
+-- | Creates the views into the images obtained by 'createSwapchain' alongside their release keys.
+--
+-- The images each have one mip level, one array layer, and color aspect.
 createImageViews
   :: Vk.SurfaceFormatKHR
   -> Vector Vk.Image
@@ -433,6 +471,7 @@ createImageViews swapchainSurfaceFormat swapchainImages device = do
       (flip (Vk.destroyImageView device) Nothing))
     swapchainImages
 
+-- | Creates a layout with a single UBO binding at 0, visible to the vertex stage.
 createDescriptorSetLayout :: Vk.Device -> ResIO Vk.DescriptorSetLayout
 createDescriptorSetLayout device = do
   let
@@ -448,6 +487,7 @@ createDescriptorSetLayout device = do
       }
   Vk.withDescriptorSetLayout device layoutInfo Nothing allocate'
 
+-- | Loads a pre-compiled SPIR-V bytecode into a shader module.
 createShaderModule :: Vk.Device -> ByteString -> ResIO (ReleaseKey, Vk.ShaderModule)
 createShaderModule device code = do
   let createInfo = (zero :: Vk.ShaderModuleCreateInfo '[]){Vk.code}
@@ -455,6 +495,11 @@ createShaderModule device code = do
     (Vk.createShaderModule device createInfo Nothing)
     (flip (Vk.destroyShaderModule device) Nothing)
 
+-- | Describes the vertices of a square ranging from (-0.5, -0.5) to (0.5, 0.5).
+--
+-- The colors are (top-left, clockwise): red, green, blue, white.
+--
+-- The vertices are linked by 'indices'.
 vertices :: SVector.Vector Vertex
 vertices = SVector.fromList
   [ Vertex (Linear.V2 -0.5 -0.5) (Linear.V3 1 0 0)
@@ -463,12 +508,23 @@ vertices = SVector.fromList
   , Vertex (Linear.V2 -0.5  0.5) (Linear.V3 1 1 1)
   ]
 
+-- | Describes two squares from 'vertices'.
 indices :: SVector.Vector Index
 indices = SVector.fromList
   [ 0, 1, 2
   , 2, 3, 0
   ]
 
+-- | Creates the full graphics pipeline, rendering the pipeline layout and pipeline:
+--
+--     * Loads the shader.
+--     * Configures the vertices from 'Vertex'.
+--     * Configures the rasterizer:
+--         * Back-face culling.
+--         * Counter-clockwise winding.
+--         * Disabled blending.
+--         * Dynamic viewport and scissor.
+--     * Sets dynamic rendering.
 createGraphicsPipeline
   :: Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
   -> ResIO (Vk.PipelineLayout, Vk.Pipeline)
@@ -567,6 +623,7 @@ createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
 
   pure (pipelineLayout, graphicsPipeline)
 
+-- | Creates a command pool with reset-command-buffer flag for the provided queue family index.
 createCommandPool :: Vk.Device -> Word32 -> ResIO Vk.CommandPool
 createCommandPool device queueIndex = do
   let
@@ -576,6 +633,11 @@ createCommandPool device queueIndex = do
       }
   Vk.withCommandPool device poolInfo Nothing allocate'
 
+-- | Helper to create a generic GPU buffer.
+--
+-- Queries memory requirements, finds a suitable buffer memory type, allocates, and device binds memory.
+--
+-- Returns the buffer and device memory along with their release keys.
 createBuffer
   :: Vk.PhysicalDevice -> Vk.Device -> Vk.DeviceSize -> Vk.BufferUsageFlags
   -> Vk.MemoryPropertyFlags -> ResIO (ReleaseKey, ReleaseKey, Vk.Buffer, Vk.DeviceMemory)
@@ -605,6 +667,11 @@ createBuffer physicalDevice device size usage properties = do
 
   pure (bufferReleaseKey, bufferMemoryReleaseKey, buffer, bufferMemory)
 
+-- | Helper to create static data buffers (like vertex and index buffers).
+--
+-- The vector is first copied into a host-visible staging buffer, then into a local-device buffer.
+--
+-- The staging buffer is released before the function returns.
 createBuffer'
   :: forall bufferElem. (Storable bufferElem)
   => SVector.Vector bufferElem -> Vk.BufferUsageFlags
@@ -638,14 +705,23 @@ createBuffer' inBuffer bufferTypeBit physicalDevice device commandPool graphicsQ
 
   pure (buffer, bufferMemory)
 
+-- | Creates a vertex buffer for 'vertices'.
 createVertexBuffer
   :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
 createVertexBuffer = createBuffer' vertices Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
 
+-- | Creates an index buffer for 'indices'.
 createIndexBuffer
   :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
 createIndexBuffer = createBuffer' indices Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
 
+-- | Creates one host-visible, host-coherent buffer for each in-flight frame.
+--
+-- The buffers are mapped persisently.
+--
+-- Returns a vector containing each buffer, its memory, and its memory handle.
+--
+-- The memory handle is updated at 'updateUniformBuffer'.
 createUniformBuffers
   :: Vk.PhysicalDevice -> Vk.Device -> ResIO (Vector (Vk.Buffer, Vk.DeviceMemory, Ptr UniformBufferObject))
 createUniformBuffers physicalDevice device = do
@@ -660,6 +736,7 @@ createUniformBuffers physicalDevice device = do
     uniformBufferMapped <- Vk.mapMemory device bufferMemory 0 (fromIntegral bufferSize) zero
     pure (buffer, bufferMemory, castPtr uniformBufferMapped)
 
+-- | Creates a pool sized to hold one UBO descriptor per in-flight frame.
 createDescriptorPool :: Vk.Device -> ResIO Vk.DescriptorPool
 createDescriptorPool device = do
   let
@@ -674,6 +751,9 @@ createDescriptorPool device = do
       }
   Vk.withDescriptorPool device poolInfo Nothing allocate'
 
+-- | Allocates one descriptor set per in-flight frame.
+--
+-- The corresponding uniform buffer is written into each set's binding 0.
 createDescriptorSets
   :: Vk.Device -> Vk.DescriptorPool -> Vk.DescriptorSetLayout -> Vector Vk.Buffer
   -> ResIO (Vector Vk.DescriptorSet)
@@ -705,6 +785,7 @@ createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers = 
 
   pure descriptorSets
 
+-- | Allocates a one-time command buffer, records a copy-buffer, submits it, and waits for the queue to idle.
 copyBuffer :: Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize -> ResIO ()
 copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size = do
   let
@@ -723,6 +804,7 @@ copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size = do
     zero
   Vk.queueWaitIdle graphicsQueue
 
+-- | Searches the device's memory type table for an index that satisfies the filter bitmask and the provided set of properties.
 findMemoryType :: (MonadIO io) => Vk.PhysicalDevice -> Word32 -> Vk.MemoryPropertyFlags -> io Word32
 findMemoryType physicalDevice typeFilter properties = do
   memProperties <- Vk.getPhysicalDeviceMemoryProperties physicalDevice
@@ -745,23 +827,26 @@ createCommandBuffers device commandPool = do
       }
   Vk.withCommandBuffers device allocInfo allocate'
 
+-- | Creates the following synchronization objects:
+--
+--     * Per-frame semaphores to signal that an image has been acquired from the swapchain and is ready for rendering.
+--     * Per-swapchain-image semaphores to signal that rendering has finished and presentation can happen.
+--     * Per-frame fences to ensure only one frame is rendered at a time.
 createSyncObjects
   :: Vk.Device -> Vector Vk.Image -> ResIO (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
 createSyncObjects device swapchainImages = do
-  -- Signal that an image has been acquired from the swapchain and is ready for rendering
   presentCompleteSemaphores <- Vector.replicateM
     maxFramesInFlight
     (Vk.withSemaphore device zero Nothing allocate')
-  -- Signal that rendering has finished and presentation can happen
   renderFinishedSemaphores <- Vector.replicateM
     (Vector.length swapchainImages)
     (Vk.withSemaphore device zero Nothing allocate')
-  -- Ensure only one frame is rendered at a time
   inFlightFences <- Vector.replicateM
     maxFramesInFlight
     (Vk.withFence device zero{Vk.flags = Vk.FENCE_CREATE_SIGNALED_BIT} Nothing allocate')
   pure (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences)
 
+-- | Initializes GLFW, Vulkan, and creates all necessary objects for 'Application'.
 initVulkan :: Bool -> Int -> Int -> ResIO Application
 initVulkan enableValidationLayers width height = do
   startTime <- liftIO Time.getCurrentTime
@@ -815,6 +900,16 @@ initVulkan enableValidationLayers width height = do
     }
   pure Application{..}
 
+-- | Records a full frame.
+--
+--     * Transitions the image to color attachment.
+--     * Begins dynamic rendering (clears to black).
+--     * Binds the pipeline.
+--     * Sets dynamic viewport/scissor.
+--     * Binds vertex/input buffers and the descriptor set.
+--     * Draws.
+--     * Ends rendering.
+--     * Transitions the image to present layout.
 recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
 recordCommandBuffer imageIndex frame = do
   Application{..} <- ask
@@ -881,6 +976,7 @@ recordCommandBuffer imageIndex frame = do
 
   Vk.endCommandBuffer frame.commandBuffer
 
+-- | Records a pipeline barrier to transition a swapchain image between two layouts with the specified access masks and pipeline stage masks.
 transitionImageLayout
   :: Word32
   -> Vk.ImageLayout
@@ -927,6 +1023,17 @@ transitionImageLayout
       }
   Vk.cmdPipelineBarrier2 frame.commandBuffer dependencyInfo
 
+-- | Orchestrates one frame:
+--
+--     * Waits for the in-flight fence.
+--     * Acquires a swapchain image.
+--     * Resets the fence.
+--     * Calls 'updateUniformBuffer' and 'recordCommandBuffer'.
+--     * Submits to the queue.
+--     * Presents.
+--
+-- If the swapchain or framebuffer is stale (because the viewport is resized),
+-- 'recreateSwapchain' is called and the function returns 'False' to indicate that the frame index should not be advanced.
 drawFrame :: Int -> MonadApplication Bool
 drawFrame frameIndex = do
   Application{..} <- ask
@@ -997,6 +1104,13 @@ drawFrame frameIndex = do
 
     pure True
 
+-- | Computes the MVP matrices and writes the result into the frame's 'uniformBufferMapped'.
+--
+-- The model is rotated around the Z axis at 90 degrees per second.
+--
+-- The camera is located at (2, 2, 2), and looks towards the origin.
+--
+-- The FOV is set at 45 degrees and y-flipped for Vulkan.
 updateUniformBuffer :: Frame -> MonadApplication ()
 updateUniformBuffer frame = do
   Application{startTime, swapchainRef} <- ask
@@ -1004,6 +1118,7 @@ updateUniformBuffer frame = do
   swapchain <- readIORef swapchainRef
   let
     time = realToFrac $ Time.diffUTCTime currentTime startTime
+    -- Need to transpose the matrices to column-major.
     model = Linear.transpose $ Linear.mkTransformation
       (Linear.axisAngle (Linear.V3 0 0 1) (time * pi / 2))
       (Linear.V3 0 0 0)
@@ -1018,6 +1133,9 @@ updateUniformBuffer frame = do
     ubo = UniformBufferObject{view = view', ..}
   liftIO $ poke frame.uniformBufferMapped ubo
 
+-- | Checks whether a Vulkan exception was thrown indicating an out of date result.
+--
+-- If yes, it's returned as a result, otherwise the exception is rethrown.
 catchOutOfDate :: (MonadUnliftIO m) => m Vk.Result -> m Vk.Result
 catchOutOfDate action =
   action `catch` \exn@(VulkanException r) ->
@@ -1025,11 +1143,17 @@ catchOutOfDate action =
     then pure r
     else throwIO exn
 
+-- | Releases the swapchain's image views and the swapchain.
 cleanupSwapchain :: Vector ReleaseKey -> ReleaseKey -> ResIO ()
 cleanupSwapchain swapchainImageViewsReleaseKeys swapchainReleaseKey = do
   traverse_ release swapchainImageViewsReleaseKeys
   release swapchainReleaseKey
 
+-- | Calls 'cleanupSwapchain' and recreates them, updating the swapchain reference.
+--
+-- This function should be called whenever the application is resized.
+--
+-- If the application is minimized, the application is paused.
 recreateSwapchain :: MonadApplication ()
 recreateSwapchain = do
   Application{..} <- ask
@@ -1051,6 +1175,7 @@ recreateSwapchain = do
       createImageViews surfaceFormat images device
     writeIORef swapchainRef Swapchain{..}
 
+-- | While the window should not close, pools events and renders frames.
 mainLoop :: MonadApplication ()
 mainLoop = do
   Application{window} <- ask
@@ -1062,6 +1187,7 @@ mainLoop = do
     unless skippedFrame do
       writeIORef frameIndexRef $ (frameIndex + 1) `mod` maxFramesInFlight
 
+-- | Creates a window and renders the contents from the Vulkan triangle (now a square) tutorial.
 defaultMain :: IO ()
 defaultMain = catch
   (runResourceT do
