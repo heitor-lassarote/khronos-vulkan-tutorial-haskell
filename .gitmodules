@@ -1,0 +1,3 @@
+[submodule "khronos-vulkan-tutorial-cpp"]
+	path = khronos-vulkan-tutorial-cpp
+	url = https://github.com/KhronosGroup/Vulkan-Tutorial

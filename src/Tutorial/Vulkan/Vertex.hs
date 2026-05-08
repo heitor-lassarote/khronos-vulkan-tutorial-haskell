@@ -16,8 +16,9 @@ import Vulkan           qualified as Vk
 
 type Vertex :: Type
 data Vertex = Vertex
-  { pos   :: Linear.V2 Float
-  , color :: Linear.V3 Float
+  { pos      :: Linear.V2 Float
+  , color    :: Linear.V3 Float
+  , texCoord :: Linear.V2 Float
   }
 
 type Index :: Type
@@ -29,7 +30,7 @@ indexType = Vk.INDEX_TYPE_UINT16
 
 instance Storable Vertex where
   sizeOf _ =
-    sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)
+    2 * sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)
 
   alignment _ = alignment (undefined :: Float)
 
@@ -37,12 +38,14 @@ instance Storable Vertex where
     let p = castPtr ptr
     pos <- peek p
     color <- peekByteOff p (sizeOf (undefined :: Linear.V2 Float))
+    texCoord <- peekByteOff p (sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float))
     pure Vertex{..}
 
   poke ptr Vertex{..} = do
     let p = castPtr ptr
     poke p pos
     pokeByteOff p (sizeOf (undefined :: Linear.V2 Float)) color
+    pokeByteOff p (sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)) texCoord
 
 getBindingDescription :: Vk.VertexInputBindingDescription
 getBindingDescription = Vk.VertexInputBindingDescription
@@ -60,5 +63,9 @@ getAttributeDescriptions = Vector.fromList
   , Vk.VertexInputAttributeDescription
     { Vk.location = 1, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32B32_SFLOAT
     , Vk.offset = fromIntegral $ sizeOf (undefined :: Linear.V2 Float)
+    }
+  , Vk.VertexInputAttributeDescription
+    { Vk.location = 2, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32_SFLOAT
+    , Vk.offset = fromIntegral $ sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)
     }
   ]

@@ -68,6 +68,7 @@ library:
   - bytestring
   - filepath
   - GLFW-b
+  - JuicyPixels
   - lens
   - linear
   - monad-loops

@@ -1,5 +1,6 @@
 module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 
+import Codec.Picture                (Image (..), convertRGBA8, readImage)
 import Control.Lens                 (_1, view, (%~), (&))
 import Control.Monad                (unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
@@ -253,10 +254,11 @@ setupDebugMessenger enableValidationLayers inst =
 --     1. Vulkan API 1.3 or greater.
 --     2. Graphics queues.
 --     3. The swapchain extension.
---     4. Shaders.
---     5. Dynamic rendering.
---     6. @synchronization2@.
---     7. Extended dynamic state.
+--     4. Sampler anisotropy.
+--     5. Shaders.
+--     6. Dynamic rendering.
+--     7. @synchronization2@.
+--     8. Extended dynamic state.
 pickPhysicalDevice :: Vk.Instance -> IO Vk.PhysicalDevice
 pickPhysicalDevice inst = do
   physicalDevices <-
@@ -266,6 +268,7 @@ pickPhysicalDevice inst = do
     throwIO $ RuntimeError "Failed to find GPUs with Vulkan support"
   devices <- flip Vector.filterM physicalDevices \physicalDevice -> do
     properties <- Vk.getPhysicalDeviceProperties physicalDevice
+    supportedFeatures <- Vk.getPhysicalDeviceFeatures physicalDevice
     features <- Vk.getPhysicalDeviceFeatures2
       @'[ Vk.PhysicalDeviceVulkan11Features
         , Vk.PhysicalDeviceVulkan13Features
@@ -293,7 +296,8 @@ pickPhysicalDevice inst = do
         :& physicalDeviceExtendedDynamicStateFeatures
         :& ()) = features.next
       supportsRequiredFeatures =
-        physicalDeviceVulkan11Features.shaderDrawParameters
+        supportedFeatures.samplerAnisotropy
+        && physicalDeviceVulkan11Features.shaderDrawParameters
         && physicalDeviceVulkan13Features.dynamicRendering
         && physicalDeviceVulkan13Features.synchronization2
         && physicalDeviceExtendedDynamicStateFeatures.extendedDynamicState
@@ -333,7 +337,13 @@ createLogicalDevice physicalDevice surface = do
       }
     featureChain =
       (zero :: Vk.PhysicalDeviceFeatures2 '[])
-      :& (zero :: Vk.PhysicalDeviceVulkan11Features){Vk.shaderDrawParameters = True}
+        { Vk.features = (zero :: Vk.PhysicalDeviceFeatures)
+          { Vk.samplerAnisotropy = True
+          }
+        }
+      :& (zero :: Vk.PhysicalDeviceVulkan11Features)
+        { Vk.shaderDrawParameters = True
+        }
       :& (zero :: Vk.PhysicalDeviceVulkan13Features)
         { Vk.dynamicRendering = True
         , Vk.synchronization2 = True
@@ -446,32 +456,21 @@ createSwapchain device physicalDevice surface window = do
 
 -- | Creates the views into the images obtained by 'createSwapchain' alongside their release keys.
 --
--- The images each have one mip level, one array layer, and color aspect.
+-- See 'createImageView'.
 createImageViews
-  :: Vk.SurfaceFormatKHR
+  :: Vk.Device
+  -> Vk.SurfaceFormatKHR
   -> Vector Vk.Image
-  -> Vk.Device
   -> ResIO (Vector ReleaseKey, Vector Vk.ImageView)
-createImageViews swapchainSurfaceFormat swapchainImages device = do
-  let
-    imageViewCreateInfo = (zero :: Vk.ImageViewCreateInfo '[])
-      { Vk.viewType = Vk.IMAGE_VIEW_TYPE_2D
-      , Vk.format = swapchainSurfaceFormat.format
-      , Vk.subresourceRange = Vk.ImageSubresourceRange
-        { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
-        , Vk.baseMipLevel = 0
-        , Vk.levelCount = 1
-        , Vk.baseArrayLayer = 0
-        , Vk.layerCount = 1
-        }
-      }
+createImageViews device swapchainSurfaceFormat swapchainImages = do
   Vector.unzip <$> traverse
-    (\image -> allocate
-      (Vk.createImageView device imageViewCreateInfo{Vk.image} Nothing)
-      (flip (Vk.destroyImageView device) Nothing))
+    (\image -> createImageView device image swapchainSurfaceFormat.format)
     swapchainImages
 
--- | Creates a layout with a single UBO binding at 0, visible to the vertex stage.
+-- | Creates a descriptor set layout with two layouts:
+--
+--     1. UBO binding at 0, visible to the vertex stage.
+--     2. Combined image sampler binding at 1, visible to the fragment stage.
 createDescriptorSetLayout :: Vk.Device -> ResIO Vk.DescriptorSetLayout
 createDescriptorSetLayout device = do
   let
@@ -482,8 +481,18 @@ createDescriptorSetLayout device = do
       , Vk.stageFlags = Vk.SHADER_STAGE_VERTEX_BIT
       , Vk.immutableSamplers = Vector.empty
       }
+    combinedImageSamplerBinding = Vk.DescriptorSetLayoutBinding
+      { Vk.binding = 1
+      , Vk.descriptorType = Vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+      , Vk.descriptorCount = 1
+      , Vk.stageFlags = Vk.SHADER_STAGE_FRAGMENT_BIT
+      , Vk.immutableSamplers = Vector.empty
+      }
     layoutInfo = (zero :: Vk.DescriptorSetLayoutCreateInfo '[])
-      { Vk.bindings = Vector.singleton uboLayoutBinding
+      { Vk.bindings = Vector.fromList
+        [ uboLayoutBinding
+        , combinedImageSamplerBinding
+        ]
       }
   Vk.withDescriptorSetLayout device layoutInfo Nothing allocate'
 
@@ -499,16 +508,18 @@ createShaderModule device code = do
 --
 -- The colors are (top-left, clockwise): red, green, blue, white.
 --
+-- The texture coordinates (UV) simply go from (0, 0) in the top-left corner to (1, 1) in the bottom-right corner.
+--
 -- The vertices are linked by 'indices'.
 vertices :: SVector.Vector Vertex
 vertices = SVector.fromList
-  [ Vertex (Linear.V2 -0.5 -0.5) (Linear.V3 1 0 0)
-  , Vertex (Linear.V2  0.5 -0.5) (Linear.V3 0 1 0)
-  , Vertex (Linear.V2  0.5  0.5) (Linear.V3 0 0 1)
-  , Vertex (Linear.V2 -0.5  0.5) (Linear.V3 1 1 1)
+  [ Vertex (Linear.V2 -0.5 -0.5) (Linear.V3 1 0 0) (Linear.V2 1 0)
+  , Vertex (Linear.V2  0.5 -0.5) (Linear.V3 0 1 0) (Linear.V2 0 0)
+  , Vertex (Linear.V2  0.5  0.5) (Linear.V3 0 0 1) (Linear.V2 0 1)
+  , Vertex (Linear.V2 -0.5  0.5) (Linear.V3 1 1 1) (Linear.V2 1 1)
   ]
 
--- | Describes two squares from 'vertices'.
+-- | Describes two triangles from 'vertices'.
 indices :: SVector.Vector Index
 indices = SVector.fromList
   [ 0, 1, 2
@@ -633,6 +644,276 @@ createCommandPool device queueIndex = do
       }
   Vk.withCommandPool device poolInfo Nothing allocate'
 
+-- | Loads a texture from the disk (./khronos-vulkan-tutorial-cpp/images/texture.jpg) in RGBA8 format.
+--
+-- The image is optimized for transfer destination and sampled,
+-- created with 'createImage', using optimal tiling on the local device.
+--
+-- Returns the allocated image and image memory.
+createTextureImage
+  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> ResIO Vk.Image
+createTextureImage physicalDevice device commandPool graphicsQueue =
+  liftIO (readImage ("khronos-vulkan-tutorial-cpp" </> "images" </> "texture" <.> "jpg")) >>= \case
+    Left err -> throwIO $ RuntimeError $ "Failed to load texture image: " <> err
+    Right (convertRGBA8 -> pixels) -> do
+      let imageSize = fromIntegral $ pixels.imageWidth * pixels.imageHeight * 4
+      (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
+        physicalDevice
+        device
+        imageSize
+        Vk.BUFFER_USAGE_TRANSFER_SRC_BIT
+        (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+      data' <- Vk.mapMemory device stagingBufferMemory 0 imageSize zero
+      liftIO $ SVector.unsafeWith pixels.imageData \ptr ->
+        copyBytes (castPtr data') ptr (fromIntegral imageSize)
+      Vk.unmapMemory device stagingBufferMemory
+
+      (textureImage, _imageMemory) <- createImage
+        physicalDevice
+        device
+        (fromIntegral pixels.imageWidth)
+        (fromIntegral pixels.imageHeight)
+        Vk.FORMAT_R8G8B8A8_SRGB
+        Vk.IMAGE_TILING_OPTIMAL
+        (Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
+        Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+
+      transitionImageLayout'
+        device
+        commandPool
+        graphicsQueue
+        textureImage
+        Vk.IMAGE_LAYOUT_UNDEFINED
+        Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      copyBufferToImage
+        device
+        commandPool
+        graphicsQueue
+        stagingBuffer
+        textureImage
+        (fromIntegral pixels.imageWidth)
+        (fromIntegral pixels.imageHeight)
+      transitionImageLayout'
+        device
+        commandPool
+        graphicsQueue
+        textureImage
+        Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+
+      release stagingBufferMemoryReleaseKey
+      release stagingBufferReleaseKey
+
+      pure textureImage
+
+-- | Creates a 2D image with undefined layout and no multisampling.
+--
+-- Returns the allocated image and image memory.
+createImage
+  :: Vk.PhysicalDevice -> Vk.Device
+  -> Word32 -> Word32
+  -> Vk.Format -> Vk.ImageTiling -> Vk.ImageUsageFlags -> Vk.MemoryPropertyFlags
+  -> ResIO (Vk.Image, Vk.DeviceMemory)
+createImage physicalDevice device width height format tiling usage properties = do
+  let
+    imageInfo = (zero :: Vk.ImageCreateInfo '[])
+      { Vk.imageType = Vk.IMAGE_TYPE_2D
+      , Vk.format
+      , Vk.tiling
+      , Vk.extent = Vk.Extent3D width height 1
+      , Vk.mipLevels = 1
+      , Vk.arrayLayers = 1
+      , Vk.samples = Vk.SAMPLE_COUNT_1_BIT
+      , Vk.usage
+      , Vk.sharingMode = Vk.SHARING_MODE_EXCLUSIVE
+      , Vk.initialLayout = Vk.IMAGE_LAYOUT_UNDEFINED
+      }
+  image <- Vk.withImage device imageInfo Nothing allocate'
+
+  memRequirements <- Vk.getImageMemoryRequirements device image
+  memoryTypeIndex <- findMemoryType physicalDevice memRequirements.memoryTypeBits properties
+  let
+    allocInfo = (zero :: Vk.MemoryAllocateInfo '[])
+      { Vk.allocationSize = memRequirements.size
+      , Vk.memoryTypeIndex
+      }
+  imageMemory <- Vk.withMemory device allocInfo Nothing allocate'
+  Vk.bindImageMemory device image imageMemory 0
+
+  pure (image, imageMemory)
+
+-- | Allocates an one-time command buffer, performs an action, submits it,
+-- waits for the queue to idle, and releases the command buffer.
+withSingleTimeCommands
+  :: (MonadResource io) => Vk.Device -> Vk.CommandPool -> Vk.Queue -> (Vk.CommandBuffer -> io r)
+  -> io r
+withSingleTimeCommands device commandPool graphicsQueue action = do
+  let
+    allocInfo = (zero :: Vk.CommandBufferAllocateInfo)
+      { Vk.commandPool
+      , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
+      , Vk.commandBufferCount = 1
+      }
+  (commandBufferReleaseKey, commandBuffers) <- allocate
+    (Vk.allocateCommandBuffers device allocInfo)
+    (Vk.freeCommandBuffers device commandPool)
+  let commandBuffer = Vector.head commandBuffers
+
+  ret <- Vk.useCommandBuffer commandBuffer zero{Vk.flags = Vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT} $
+    action commandBuffer
+
+  let
+    submitInfo = (zero :: Vk.SubmitInfo '[])
+      { Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle commandBuffer
+      }
+  Vk.queueSubmit
+    graphicsQueue
+    (Vector.singleton $ SomeStruct submitInfo)
+    zero
+  Vk.queueWaitIdle graphicsQueue
+
+  release commandBufferReleaseKey
+
+  pure ret
+
+-- | Helper function to transition a texture image between layouts using a pipeline barrier.
+--
+-- Currently, only the following transitions are supported:
+--
+--     1. From undefined to transfer-dst (preparing to receive a copy).
+--     2. From transfer-dst to shader-read-only (making it available to the fragment shader after a copy).
+transitionImageLayout'
+  :: Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> Vk.Image -> Vk.ImageLayout -> Vk.ImageLayout -> ResIO ()
+transitionImageLayout' device commandPool graphicsQueue image oldLayout newLayout =
+  withSingleTimeCommands device commandPool graphicsQueue \commandBuffer -> do
+    (srcAccessMask, dstAccessMask, sourceStage, destinationStage) <-
+      case (oldLayout, newLayout) of
+        (Vk.IMAGE_LAYOUT_UNDEFINED, Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) ->
+          pure
+            ( zeroBits
+            , Vk.ACCESS_TRANSFER_WRITE_BIT
+            , Vk.PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            , Vk.PIPELINE_STAGE_TRANSFER_BIT
+            )
+        (Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) ->
+          pure
+            ( Vk.ACCESS_TRANSFER_WRITE_BIT
+            , Vk.ACCESS_SHADER_READ_BIT
+            , Vk.PIPELINE_STAGE_TRANSFER_BIT
+            , Vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+            )
+        (_, _) -> throwIO $ RuntimeError "Unsupported layout transition!"
+    let
+      barrier = (zero :: Vk.ImageMemoryBarrier '[])
+        { Vk.srcAccessMask
+        , Vk.dstAccessMask
+        , Vk.oldLayout
+        , Vk.newLayout
+        , Vk.image
+        , Vk.subresourceRange = zero
+          { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
+          , Vk.baseMipLevel = 0
+          , Vk.levelCount = 1
+          , Vk.baseArrayLayer = 0
+          , Vk.layerCount = 1
+          }
+        }
+    Vk.cmdPipelineBarrier
+      commandBuffer
+      sourceStage
+      destinationStage
+      zero
+      Vector.empty
+      Vector.empty
+      (Vector.singleton $ SomeStruct barrier)
+    pure ()
+
+-- | Copies pixel data from the provided staging buffer into the provided image.
+--
+-- The image is fully covered, with a single mip level, single layer, and tightly packed rows.
+copyBufferToImage
+  :: Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> Vk.Buffer -> Vk.Image -> Word32 -> Word32
+  -> ResIO ()
+copyBufferToImage device commandPool graphicsQueue buffer image width height =
+  withSingleTimeCommands device commandPool graphicsQueue \commandBuffer -> do
+    let
+      region = Vk.BufferImageCopy
+        { Vk.bufferOffset = 0
+        , Vk.bufferRowLength = 0
+        , Vk.bufferImageHeight = 0
+        , Vk.imageSubresource = Vk.ImageSubresourceLayers
+          { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
+          , Vk.mipLevel = 0
+          , Vk.baseArrayLayer = 0
+          , Vk.layerCount = 1
+          }
+        , Vk.imageOffset = Vk.Offset3D 0 0 0
+        , Vk.imageExtent = Vk.Extent3D width height 1
+        }
+    Vk.cmdCopyBufferToImage
+      commandBuffer
+      buffer
+      image
+      Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      (Vector.singleton region)
+
+-- | Helper function to create an image view for a given image with a format.
+--
+-- The image view each have one mip level, one array layer, and color aspect.
+createImageView :: Vk.Device -> Vk.Image -> Vk.Format -> ResIO (ReleaseKey, Vk.ImageView)
+createImageView device image format = do
+  let
+    imageViewCreateInfo = (zero :: Vk.ImageViewCreateInfo '[])
+      { Vk.viewType = Vk.IMAGE_VIEW_TYPE_2D
+      , Vk.format
+      , Vk.subresourceRange = Vk.ImageSubresourceRange
+        { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
+        , Vk.baseMipLevel = 0
+        , Vk.levelCount = 1
+        , Vk.baseArrayLayer = 0
+        , Vk.layerCount = 1
+        }
+      }
+  allocate
+    (Vk.createImageView device imageViewCreateInfo{Vk.image} Nothing)
+    (flip (Vk.destroyImageView device) Nothing)
+
+-- | Creates an image view for a texture.
+--
+-- See 'createImageView'.
+createTextureImageView :: Vk.Device -> Vk.Image -> ResIO (ReleaseKey, Vk.ImageView)
+createTextureImageView device textureImage =
+  createImageView device textureImage Vk.FORMAT_R8G8B8A8_SRGB
+
+-- | Creates a texture sampler with linear filtering and repeat address mode.
+--
+-- The anisotropy is enabled with the maximum supported sampler anisotropy.
+createTextureSampler :: Vk.Device -> Vk.PhysicalDevice -> ResIO Vk.Sampler
+createTextureSampler device physicalDevice = do
+  properties <- Vk.getPhysicalDeviceProperties physicalDevice
+  let
+    samplerInfo = (zero :: Vk.SamplerCreateInfo '[])
+      { Vk.magFilter = Vk.FILTER_LINEAR
+      , Vk.minFilter = Vk.FILTER_LINEAR
+      , Vk.mipmapMode = Vk.SAMPLER_MIPMAP_MODE_LINEAR
+      , Vk.addressModeU = Vk.SAMPLER_ADDRESS_MODE_REPEAT
+      , Vk.addressModeV = Vk.SAMPLER_ADDRESS_MODE_REPEAT
+      , Vk.addressModeW = Vk.SAMPLER_ADDRESS_MODE_REPEAT
+      , Vk.anisotropyEnable = True
+      , Vk.maxAnisotropy = properties.limits.maxSamplerAnisotropy
+      , Vk.compareEnable = False
+      , Vk.compareOp = Vk.COMPARE_OP_ALWAYS
+      , Vk.borderColor = Vk.BORDER_COLOR_INT_OPAQUE_BLACK
+      , Vk.unnormalizedCoordinates = False
+      , Vk.mipLodBias = 0
+      , Vk.minLod = 0
+      , Vk.maxLod = 0
+      }
+  Vk.withSampler device samplerInfo Nothing allocate'
+
 -- | Helper to create a generic GPU buffer.
 --
 -- Queries memory requirements, finds a suitable buffer memory type, allocates, and device binds memory.
@@ -740,24 +1021,36 @@ createUniformBuffers physicalDevice device = do
 createDescriptorPool :: Vk.Device -> ResIO Vk.DescriptorPool
 createDescriptorPool device = do
   let
-    poolSize = Vk.DescriptorPoolSize
+    uboPoolSize = Vk.DescriptorPoolSize
       { Vk.type' = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
+      , Vk.descriptorCount = fromIntegral maxFramesInFlight
+      }
+    combinedImageSamplerPoolSize = Vk.DescriptorPoolSize
+      { Vk.type' = Vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
       , Vk.descriptorCount = fromIntegral maxFramesInFlight
       }
     poolInfo = (zero :: Vk.DescriptorPoolCreateInfo '[])
       { Vk.flags = Vk.DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
       , Vk.maxSets = fromIntegral maxFramesInFlight
-      , Vk.poolSizes = Vector.singleton poolSize
+      , Vk.poolSizes = Vector.fromList
+        [ uboPoolSize
+        , combinedImageSamplerPoolSize
+        ]
       }
   Vk.withDescriptorPool device poolInfo Nothing allocate'
 
 -- | Allocates one descriptor set per in-flight frame.
 --
--- The corresponding uniform buffer is written into each set's binding 0.
+--
+-- The following are written into each set's binding:
+--
+--     1. The uniform buffer at binding 0.
+--     2. The texture sampler and image view at binding 1.
 createDescriptorSets
   :: Vk.Device -> Vk.DescriptorPool -> Vk.DescriptorSetLayout -> Vector Vk.Buffer
+  -> Vk.Sampler -> Vk.ImageView
   -> ResIO (Vector Vk.DescriptorSet)
-createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers = do
+createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers textureSampler textureImageView = do
   let
     layouts = Vector.replicate maxFramesInFlight descriptorSetLayout
     allocInfo = (zero :: Vk.DescriptorSetAllocateInfo '[])
@@ -773,36 +1066,38 @@ createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers = 
         , Vk.offset = 0
         , Vk.range = fromIntegral $ sizeOf (undefined :: UniformBufferObject)
         }
-      descriptorWrite = (zero :: Vk.WriteDescriptorSet '[])
-        { Vk.dstSet = descriptorSet
-        , Vk.dstBinding = 0
-        , Vk.dstArrayElement = 0
-        , Vk.descriptorCount = 1
-        , Vk.descriptorType = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
-        , Vk.bufferInfo = Vector.singleton bufferInfo
+      imageInfo = Vk.DescriptorImageInfo
+        { Vk.sampler = textureSampler
+        , Vk.imageView = textureImageView
+        , Vk.imageLayout = Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
         }
-    Vk.updateDescriptorSets device (Vector.singleton $ SomeStruct descriptorWrite) Vector.empty
+      descriptorWrites = Vector.fromList
+        [ SomeStruct (zero :: Vk.WriteDescriptorSet '[])
+          { Vk.dstSet = descriptorSet
+          , Vk.dstBinding = 0
+          , Vk.dstArrayElement = 0
+          , Vk.descriptorCount = 1
+          , Vk.descriptorType = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
+          , Vk.bufferInfo = Vector.singleton bufferInfo
+          }
+        , SomeStruct (zero :: Vk.WriteDescriptorSet '[])
+          { Vk.dstSet = descriptorSet
+          , Vk.dstBinding = 1
+          , Vk.dstArrayElement = 0
+          , Vk.descriptorCount = 1
+          , Vk.descriptorType = Vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+          , Vk.imageInfo = Vector.singleton imageInfo
+          }
+        ]
+    Vk.updateDescriptorSets device descriptorWrites Vector.empty
 
   pure descriptorSets
 
--- | Allocates a one-time command buffer, records a copy-buffer, submits it, and waits for the queue to idle.
+-- | Allocates an one-time command buffer, records a copy-buffer, submits it, and waits for the queue to idle.
 copyBuffer :: Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize -> ResIO ()
-copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size = do
-  let
-    allocInfo = (zero :: Vk.CommandBufferAllocateInfo)
-      { Vk.commandPool
-      , Vk.level = Vk.COMMAND_BUFFER_LEVEL_PRIMARY
-      , Vk.commandBufferCount = 1
-      }
-  commandCopyBuffer <- Vector.head <$> Vk.withCommandBuffers device allocInfo allocate'
-  Vk.useCommandBuffer commandCopyBuffer zero{Vk.flags = Vk.COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT} do
+copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size =
+  withSingleTimeCommands device commandPool graphicsQueue \commandCopyBuffer ->
     Vk.cmdCopyBuffer commandCopyBuffer srcBuffer dstBuffer (Vector.singleton $ Vk.BufferCopy 0 0 size)
-
-  Vk.queueSubmit
-    graphicsQueue
-    (Vector.singleton $ SomeStruct zero{Vk.commandBuffers = Vector.singleton $ Vk.commandBufferHandle commandCopyBuffer})
-    zero
-  Vk.queueWaitIdle graphicsQueue
 
 -- | Searches the device's memory type table for an index that satisfies the filter bitmask and the provided set of properties.
 findMemoryType :: (MonadIO io) => Vk.PhysicalDevice -> Word32 -> Vk.MemoryPropertyFlags -> io Word32
@@ -817,6 +1112,7 @@ findMemoryType physicalDevice typeFilter properties = do
     Nothing -> throwIO $ RuntimeError "Failed to find suitable memory type!"
     Just memType -> pure $ fromIntegral memType
 
+-- | Helper to create 'maxFramesInFlight' numbers of command buffers.
 createCommandBuffers :: Vk.Device -> Vk.CommandPool -> ResIO (Vector Vk.CommandBuffer)
 createCommandBuffers device commandPool = do
   let
@@ -860,11 +1156,14 @@ initVulkan enableValidationLayers width height = do
   (swapchainReleaseKey, swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent) <-
     createSwapchain device physicalDevice surface window
   (swapchainImageViewsReleaseKeys, swapchainImageViews) <-
-    createImageViews swapchainSurfaceFormat swapchainImages device
+    createImageViews device swapchainSurfaceFormat swapchainImages
   descriptorSetLayout <- createDescriptorSetLayout device
   (pipelineLayout, graphicsPipeline) <-
     createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
+  textureImage <- createTextureImage physicalDevice device commandPool queue
+  (_textureImageViewReleaseKey, textureImageView) <- createTextureImageView device textureImage
+  textureSampler <- createTextureSampler device physicalDevice
   (vertexBuffer, vertexBufferMemory) <-
     createVertexBuffer physicalDevice device commandPool queue
   (indexBuffer, indexBufferMemory) <-
@@ -873,7 +1172,7 @@ initVulkan enableValidationLayers width height = do
   descriptorPool <- createDescriptorPool device
   descriptorSets <- do
     let uniformBuffers' = fmap (view _1) uniformBuffers
-    createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers'
+    createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers' textureSampler textureImageView
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
     createSyncObjects device swapchainImages
@@ -1172,7 +1471,7 @@ recreateSwapchain = do
     (releaseKey, swapchain, surfaceFormat, images, extent) <-
       createSwapchain device physicalDevice surface window
     (imageViewsReleaseKeys, imageViews) <-
-      createImageViews surfaceFormat images device
+      createImageViews device surfaceFormat images
     writeIORef swapchainRef Swapchain{..}
 
 -- | While the window should not close, pools events and renders frames.

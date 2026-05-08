@@ -65,6 +65,7 @@ library
       cbits/debug_callback.c
   build-depends:
       GLFW-b
+    , JuicyPixels
     , base >=4.7 && <5
     , bytestring
     , filepath
