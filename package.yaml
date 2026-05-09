@@ -24,10 +24,12 @@ dependencies:
 
 default-extensions:
 - BlockArguments
+- ConstraintKinds
 - DataKinds
 - DeriveAnyClass
 - DerivingStrategies
 - DuplicateRecordFields
+- FlexibleContexts
 - GeneralizedNewtypeDeriving
 - ImportQualifiedPost
 - LambdaCase

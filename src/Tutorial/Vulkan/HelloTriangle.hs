@@ -6,7 +6,6 @@ import Control.Monad                (unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
 import Control.Monad.Reader         (MonadReader (..), ReaderT (..))
-import Control.Monad.Trans          (lift)
 import Control.Monad.Trans.Resource
   (MonadResource, ReleaseKey, ResIO, allocate, allocate_, release, runResourceT)
 import Data.Bits                    (Bits (..))
@@ -14,7 +13,7 @@ import Data.ByteString.Char8        (ByteString)
 import Data.ByteString.Char8        qualified as BS
 import Data.Foldable                (find, for_, traverse_)
 import Data.Functor                 ((<&>))
-import Data.Kind                    (Type)
+import Data.Kind                    (Constraint, Type)
 import Data.Maybe                   (fromJust, fromMaybe, isJust)
 import Data.Ord                     (clamp)
 import Data.Time                    (UTCTime)
@@ -91,8 +90,8 @@ instance Storable UniformBufferObject where
     pokeByteOff p (sizeOf (undefined :: Linear.M44 Float)) view'
     pokeByteOff p (2 * sizeOf (undefined :: Linear.M44 Float)) proj
 
-type Application :: Type
-data Application = Application
+type ApplicationEnv :: Type
+data ApplicationEnv = ApplicationEnv
   { window                   :: GLFW.Window
   , frames                   :: Vector Frame
   , surface                  :: Vk.SurfaceKHR
@@ -112,15 +111,22 @@ data Application = Application
   , startTime                :: UTCTime
   }
 
-type MonadApplication :: Type -> Type
-newtype MonadApplication a = MonadApplication
-  { runMonadApplication :: ReaderT Application ResIO a
+type MonadApplication :: (Type -> Type) -> Constraint
+type MonadApplication m =
+  ( MonadReader ApplicationEnv m
+  , MonadResource m
+  , MonadUnliftIO m
+  )
+
+type Application :: Type -> Type
+newtype Application a = Application
+  { runApplication :: ReaderT ApplicationEnv ResIO a
   }
   deriving newtype (Functor, Applicative, Monad, MonadIO, MonadResource, MonadUnliftIO)
 
-instance MonadReader Application MonadApplication where
-  ask = MonadApplication ask
-  local f = MonadApplication . local f . (.runMonadApplication)
+instance MonadReader ApplicationEnv Application where
+  ask = Application ask
+  local f = Application . local f . (.runApplication)
 
 type RuntimeError :: Type
 newtype RuntimeError = RuntimeError String
@@ -153,12 +159,12 @@ maxFramesInFlight :: Int
 maxFramesInFlight = 2
 
 -- | Allocates memory with @resourcet@'s 'allocate', discarding the release key.
-allocate' :: IO a -> (a -> IO ()) -> ResIO a
+allocate' :: (MonadResource m) => IO a -> (a -> IO ()) -> m a
 allocate' create destroy = snd <$> allocate create destroy
 
 -- | Initializes the GLFW window with the provided width and height.
 -- The bool reference is set to 'True' if the window is resized with GLFW's resize callback.
-initWindow :: Int -> Int -> IORef Bool -> ResIO GLFW.Window
+initWindow :: (MonadResource m) => Int -> Int -> IORef Bool -> m GLFW.Window
 initWindow width height framebufferResizedRef = do
   _glfwKeyReleaseKey <- allocate_ GLFW.init GLFW.terminate
 
@@ -195,7 +201,7 @@ getRequiredInstanceExtensions enableValidationLayers = do
   pure $ (if enableValidationLayers then Vector.cons Vk.EXT_DEBUG_UTILS_EXTENSION_NAME else id) glfwExtensions
 
 -- | Creates a Vulkan instance, optionally enabling the validation layer.
-createInstance :: Bool -> ResIO Vk.Instance
+createInstance :: (MonadResource m) => Bool -> m Vk.Instance
 createInstance enableValidationLayers = do
   when enableValidationLayers do
     layerNames <-
@@ -227,7 +233,7 @@ createInstance enableValidationLayers = do
     | otherwise              = Vector.empty
 
 -- | Optionally registers a debug messenger. See 'debugCallbackPtr'.
-setupDebugMessenger :: Bool -> Vk.Instance -> ResIO (Maybe Vk.DebugUtilsMessengerEXT)
+setupDebugMessenger :: (MonadResource m) => Bool -> Vk.Instance -> m (Maybe Vk.DebugUtilsMessengerEXT)
 setupDebugMessenger enableValidationLayers inst =
   if enableValidationLayers then do
     let
@@ -311,7 +317,7 @@ pickPhysicalDevice inst = do
 -- | Creates a logical device that supports all capabilities from 'pickPhysicalDevice'.
 --
 -- This function also retrieves the graphics+present queue and its index.
-createLogicalDevice :: Vk.PhysicalDevice -> Vk.SurfaceKHR -> ResIO (Vk.Device, Vk.Queue, Word32)
+createLogicalDevice :: (MonadResource m) => Vk.PhysicalDevice -> Vk.SurfaceKHR -> m (Vk.Device, Vk.Queue, Word32)
 createLogicalDevice physicalDevice surface = do
   queueFamilyProperties <- Vk.getPhysicalDeviceQueueFamilyProperties physicalDevice
 
@@ -361,7 +367,7 @@ createLogicalDevice physicalDevice surface = do
   pure (device, graphicsQueue, queueIndex)
 
 -- | Uses GLFW to create a Vulkan surface.
-createSurface :: Vk.Instance -> GLFW.Window -> ResIO Vk.SurfaceKHR
+createSurface :: (MonadResource m) => Vk.Instance -> GLFW.Window -> m Vk.SurfaceKHR
 createSurface inst window = do
   allocate'
     (alloca \surfPtr ->
@@ -414,11 +420,12 @@ chooseSwapMinImageCount capabilities
 --
 -- Also returns the swapchain images, format, and extent.
 createSwapchain
-  :: Vk.Device
+  :: (MonadResource m)
+  => Vk.Device
   -> Vk.PhysicalDevice
   -> Vk.SurfaceKHR
   -> GLFW.Window
-  -> ResIO (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
+  -> m (ReleaseKey, Vk.SwapchainKHR, Vk.SurfaceFormatKHR, Vector Vk.Image, Vk.Extent2D)
 createSwapchain device physicalDevice surface window = do
   surfaceCapabilities <- Vk.getPhysicalDeviceSurfaceCapabilitiesKHR physicalDevice surface
   swapchainExtent <- chooseSwapExtent surfaceCapabilities window
@@ -458,10 +465,11 @@ createSwapchain device physicalDevice surface window = do
 --
 -- See 'createImageView'.
 createImageViews
-  :: Vk.Device
+  :: (MonadResource m)
+  => Vk.Device
   -> Vk.SurfaceFormatKHR
   -> Vector Vk.Image
-  -> ResIO (Vector ReleaseKey, Vector Vk.ImageView)
+  -> m (Vector ReleaseKey, Vector Vk.ImageView)
 createImageViews device swapchainSurfaceFormat swapchainImages = do
   Vector.unzip <$> traverse
     (\image -> createImageView device image swapchainSurfaceFormat.format)
@@ -471,7 +479,7 @@ createImageViews device swapchainSurfaceFormat swapchainImages = do
 --
 --     1. UBO binding at 0, visible to the vertex stage.
 --     2. Combined image sampler binding at 1, visible to the fragment stage.
-createDescriptorSetLayout :: Vk.Device -> ResIO Vk.DescriptorSetLayout
+createDescriptorSetLayout :: (MonadResource m) => Vk.Device -> m Vk.DescriptorSetLayout
 createDescriptorSetLayout device = do
   let
     uboLayoutBinding = Vk.DescriptorSetLayoutBinding
@@ -497,7 +505,7 @@ createDescriptorSetLayout device = do
   Vk.withDescriptorSetLayout device layoutInfo Nothing allocate'
 
 -- | Loads a pre-compiled SPIR-V bytecode into a shader module.
-createShaderModule :: Vk.Device -> ByteString -> ResIO (ReleaseKey, Vk.ShaderModule)
+createShaderModule :: (MonadResource m) => Vk.Device -> ByteString -> m (ReleaseKey, Vk.ShaderModule)
 createShaderModule device code = do
   let createInfo = (zero :: Vk.ShaderModuleCreateInfo '[]){Vk.code}
   allocate
@@ -537,8 +545,8 @@ indices = SVector.fromList
 --         * Dynamic viewport and scissor.
 --     * Sets dynamic rendering.
 createGraphicsPipeline
-  :: Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
-  -> ResIO (Vk.PipelineLayout, Vk.Pipeline)
+  :: (MonadResource m) => Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
+  -> m (Vk.PipelineLayout, Vk.Pipeline)
 createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
@@ -635,7 +643,7 @@ createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
   pure (pipelineLayout, graphicsPipeline)
 
 -- | Creates a command pool with reset-command-buffer flag for the provided queue family index.
-createCommandPool :: Vk.Device -> Word32 -> ResIO Vk.CommandPool
+createCommandPool :: (MonadResource m) => Vk.Device -> Word32 -> m Vk.CommandPool
 createCommandPool device queueIndex = do
   let
     poolInfo = (zero :: Vk.CommandPoolCreateInfo)
@@ -651,8 +659,8 @@ createCommandPool device queueIndex = do
 --
 -- Returns the allocated image and image memory.
 createTextureImage
-  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> ResIO Vk.Image
+  :: (MonadResource m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> m Vk.Image
 createTextureImage physicalDevice device commandPool graphicsQueue =
   liftIO (readImage ("khronos-vulkan-tutorial-cpp" </> "images" </> "texture" <.> "jpg")) >>= \case
     Left err -> throwIO $ RuntimeError $ "Failed to load texture image: " <> err
@@ -711,10 +719,10 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
 --
 -- Returns the allocated image and image memory.
 createImage
-  :: Vk.PhysicalDevice -> Vk.Device
+  :: (MonadResource m) => Vk.PhysicalDevice -> Vk.Device
   -> Word32 -> Word32
   -> Vk.Format -> Vk.ImageTiling -> Vk.ImageUsageFlags -> Vk.MemoryPropertyFlags
-  -> ResIO (Vk.Image, Vk.DeviceMemory)
+  -> m (Vk.Image, Vk.DeviceMemory)
 createImage physicalDevice device width height format tiling usage properties = do
   let
     imageInfo = (zero :: Vk.ImageCreateInfo '[])
@@ -784,8 +792,8 @@ withSingleTimeCommands device commandPool graphicsQueue action = do
 --     1. From undefined to transfer-dst (preparing to receive a copy).
 --     2. From transfer-dst to shader-read-only (making it available to the fragment shader after a copy).
 transitionImageLayout'
-  :: Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> Vk.Image -> Vk.ImageLayout -> Vk.ImageLayout -> ResIO ()
+  :: (MonadResource m) => Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> Vk.Image -> Vk.ImageLayout -> Vk.ImageLayout -> m ()
 transitionImageLayout' device commandPool graphicsQueue image oldLayout newLayout =
   withSingleTimeCommands device commandPool graphicsQueue \commandBuffer -> do
     (srcAccessMask, dstAccessMask, sourceStage, destinationStage) <-
@@ -834,9 +842,9 @@ transitionImageLayout' device commandPool graphicsQueue image oldLayout newLayou
 --
 -- The image is fully covered, with a single mip level, single layer, and tightly packed rows.
 copyBufferToImage
-  :: Vk.Device -> Vk.CommandPool -> Vk.Queue
+  :: (MonadResource m) => Vk.Device -> Vk.CommandPool -> Vk.Queue
   -> Vk.Buffer -> Vk.Image -> Word32 -> Word32
-  -> ResIO ()
+  -> m ()
 copyBufferToImage device commandPool graphicsQueue buffer image width height =
   withSingleTimeCommands device commandPool graphicsQueue \commandBuffer -> do
     let
@@ -863,7 +871,7 @@ copyBufferToImage device commandPool graphicsQueue buffer image width height =
 -- | Helper function to create an image view for a given image with a format.
 --
 -- The image view each have one mip level, one array layer, and color aspect.
-createImageView :: Vk.Device -> Vk.Image -> Vk.Format -> ResIO (ReleaseKey, Vk.ImageView)
+createImageView :: (MonadResource m) => Vk.Device -> Vk.Image -> Vk.Format -> m (ReleaseKey, Vk.ImageView)
 createImageView device image format = do
   let
     imageViewCreateInfo = (zero :: Vk.ImageViewCreateInfo '[])
@@ -884,14 +892,14 @@ createImageView device image format = do
 -- | Creates an image view for a texture.
 --
 -- See 'createImageView'.
-createTextureImageView :: Vk.Device -> Vk.Image -> ResIO (ReleaseKey, Vk.ImageView)
+createTextureImageView :: (MonadResource m) => Vk.Device -> Vk.Image -> m (ReleaseKey, Vk.ImageView)
 createTextureImageView device textureImage =
   createImageView device textureImage Vk.FORMAT_R8G8B8A8_SRGB
 
 -- | Creates a texture sampler with linear filtering and repeat address mode.
 --
 -- The anisotropy is enabled with the maximum supported sampler anisotropy.
-createTextureSampler :: Vk.Device -> Vk.PhysicalDevice -> ResIO Vk.Sampler
+createTextureSampler :: (MonadResource m) => Vk.Device -> Vk.PhysicalDevice -> m Vk.Sampler
 createTextureSampler device physicalDevice = do
   properties <- Vk.getPhysicalDeviceProperties physicalDevice
   let
@@ -920,8 +928,8 @@ createTextureSampler device physicalDevice = do
 --
 -- Returns the buffer and device memory along with their release keys.
 createBuffer
-  :: Vk.PhysicalDevice -> Vk.Device -> Vk.DeviceSize -> Vk.BufferUsageFlags
-  -> Vk.MemoryPropertyFlags -> ResIO (ReleaseKey, ReleaseKey, Vk.Buffer, Vk.DeviceMemory)
+  :: (MonadResource m) => Vk.PhysicalDevice -> Vk.Device -> Vk.DeviceSize -> Vk.BufferUsageFlags
+  -> Vk.MemoryPropertyFlags -> m (ReleaseKey, ReleaseKey, Vk.Buffer, Vk.DeviceMemory)
 createBuffer physicalDevice device size usage properties = do
   let
     bufferInfo = (zero :: Vk.BufferCreateInfo '[])
@@ -954,10 +962,10 @@ createBuffer physicalDevice device size usage properties = do
 --
 -- The staging buffer is released before the function returns.
 createBuffer'
-  :: forall bufferElem. (Storable bufferElem)
+  :: forall bufferElem m. (MonadResource m, Storable bufferElem)
   => SVector.Vector bufferElem -> Vk.BufferUsageFlags
   -> Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+  -> m (Vk.Buffer, Vk.DeviceMemory)
 createBuffer' inBuffer bufferTypeBit physicalDevice device commandPool graphicsQueue = do
   let bufferSize = sizeOf (undefined :: bufferElem) * SVector.length inBuffer
 
@@ -988,12 +996,14 @@ createBuffer' inBuffer bufferTypeBit physicalDevice device commandPool graphicsQ
 
 -- | Creates a vertex buffer for 'vertices'.
 createVertexBuffer
-  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+  :: (MonadResource m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> m (Vk.Buffer, Vk.DeviceMemory)
 createVertexBuffer = createBuffer' vertices Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
 
 -- | Creates an index buffer for 'indices'.
 createIndexBuffer
-  :: Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue -> ResIO (Vk.Buffer, Vk.DeviceMemory)
+  :: (MonadResource m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> m (Vk.Buffer, Vk.DeviceMemory)
 createIndexBuffer = createBuffer' indices Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
 
 -- | Creates one host-visible, host-coherent buffer for each in-flight frame.
@@ -1004,7 +1014,8 @@ createIndexBuffer = createBuffer' indices Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
 --
 -- The memory handle is updated at 'updateUniformBuffer'.
 createUniformBuffers
-  :: Vk.PhysicalDevice -> Vk.Device -> ResIO (Vector (Vk.Buffer, Vk.DeviceMemory, Ptr UniformBufferObject))
+  :: (MonadResource m) => Vk.PhysicalDevice -> Vk.Device
+  -> m (Vector (Vk.Buffer, Vk.DeviceMemory, Ptr UniformBufferObject))
 createUniformBuffers physicalDevice device = do
   Vector.replicateM maxFramesInFlight do
     let bufferSize = sizeOf (undefined :: UniformBufferObject)
@@ -1018,7 +1029,7 @@ createUniformBuffers physicalDevice device = do
     pure (buffer, bufferMemory, castPtr uniformBufferMapped)
 
 -- | Creates a pool sized to hold one UBO descriptor per in-flight frame.
-createDescriptorPool :: Vk.Device -> ResIO Vk.DescriptorPool
+createDescriptorPool :: (MonadResource m) => Vk.Device -> m Vk.DescriptorPool
 createDescriptorPool device = do
   let
     uboPoolSize = Vk.DescriptorPoolSize
@@ -1047,9 +1058,10 @@ createDescriptorPool device = do
 --     1. The uniform buffer at binding 0.
 --     2. The texture sampler and image view at binding 1.
 createDescriptorSets
-  :: Vk.Device -> Vk.DescriptorPool -> Vk.DescriptorSetLayout -> Vector Vk.Buffer
+  :: (MonadResource m)
+  => Vk.Device -> Vk.DescriptorPool -> Vk.DescriptorSetLayout -> Vector Vk.Buffer
   -> Vk.Sampler -> Vk.ImageView
-  -> ResIO (Vector Vk.DescriptorSet)
+  -> m (Vector Vk.DescriptorSet)
 createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers textureSampler textureImageView = do
   let
     layouts = Vector.replicate maxFramesInFlight descriptorSetLayout
@@ -1094,7 +1106,10 @@ createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers te
   pure descriptorSets
 
 -- | Allocates an one-time command buffer, records a copy-buffer, submits it, and waits for the queue to idle.
-copyBuffer :: Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize -> ResIO ()
+copyBuffer
+  :: (MonadResource m)
+  => Vk.Device -> Vk.CommandPool -> Vk.Queue -> Vk.Buffer -> Vk.Buffer -> Vk.DeviceSize
+  -> m ()
 copyBuffer device commandPool graphicsQueue srcBuffer dstBuffer size =
   withSingleTimeCommands device commandPool graphicsQueue \commandCopyBuffer ->
     Vk.cmdCopyBuffer commandCopyBuffer srcBuffer dstBuffer (Vector.singleton $ Vk.BufferCopy 0 0 size)
@@ -1113,7 +1128,7 @@ findMemoryType physicalDevice typeFilter properties = do
     Just memType -> pure $ fromIntegral memType
 
 -- | Helper to create 'maxFramesInFlight' numbers of command buffers.
-createCommandBuffers :: Vk.Device -> Vk.CommandPool -> ResIO (Vector Vk.CommandBuffer)
+createCommandBuffers :: (MonadResource m) => Vk.Device -> Vk.CommandPool -> m (Vector Vk.CommandBuffer)
 createCommandBuffers device commandPool = do
   let
     allocInfo = (zero :: Vk.CommandBufferAllocateInfo)
@@ -1129,7 +1144,9 @@ createCommandBuffers device commandPool = do
 --     * Per-swapchain-image semaphores to signal that rendering has finished and presentation can happen.
 --     * Per-frame fences to ensure only one frame is rendered at a time.
 createSyncObjects
-  :: Vk.Device -> Vector Vk.Image -> ResIO (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
+  :: (MonadResource m)
+  => Vk.Device -> Vector Vk.Image
+  -> m (Vector Vk.Semaphore, Vector Vk.Semaphore, Vector Vk.Fence)
 createSyncObjects device swapchainImages = do
   presentCompleteSemaphores <- Vector.replicateM
     maxFramesInFlight
@@ -1143,7 +1160,7 @@ createSyncObjects device swapchainImages = do
   pure (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences)
 
 -- | Initializes GLFW, Vulkan, and creates all necessary objects for 'Application'.
-initVulkan :: Bool -> Int -> Int -> ResIO Application
+initVulkan :: (MonadResource m) => Bool -> Int -> Int -> m ApplicationEnv
 initVulkan enableValidationLayers width height = do
   startTime <- liftIO Time.getCurrentTime
   framebufferResizedRef <- newIORef False
@@ -1197,7 +1214,7 @@ initVulkan enableValidationLayers width height = do
     , imageViews = swapchainImageViews
     , imageViewsReleaseKeys = swapchainImageViewsReleaseKeys
     }
-  pure Application{..}
+  pure ApplicationEnv{..}
 
 -- | Records a full frame.
 --
@@ -1209,9 +1226,9 @@ initVulkan enableValidationLayers width height = do
 --     * Draws.
 --     * Ends rendering.
 --     * Transitions the image to present layout.
-recordCommandBuffer :: Word32 -> Frame -> MonadApplication ()
+recordCommandBuffer :: (MonadApplication m) => Word32 -> Frame -> m ()
 recordCommandBuffer imageIndex frame = do
-  Application{..} <- ask
+  ApplicationEnv{..} <- ask
 
   Vk.beginCommandBuffer frame.commandBuffer zero
 
@@ -1277,7 +1294,8 @@ recordCommandBuffer imageIndex frame = do
 
 -- | Records a pipeline barrier to transition a swapchain image between two layouts with the specified access masks and pipeline stage masks.
 transitionImageLayout
-  :: Word32
+  :: (MonadApplication m)
+  => Word32
   -> Vk.ImageLayout
   -> Vk.ImageLayout
   -> Vk.AccessFlags2
@@ -1285,7 +1303,7 @@ transitionImageLayout
   -> Vk.PipelineStageFlags2
   -> Vk.PipelineStageFlags2
   -> Frame
-  -> MonadApplication ()
+  -> m ()
 transitionImageLayout
     imageIndex
     oldLayout
@@ -1295,7 +1313,7 @@ transitionImageLayout
     srcStageMask
     dstStageMask
     frame = do
-  Application{swapchainRef} <- ask
+  ApplicationEnv{swapchainRef} <- ask
   swapchain <- readIORef swapchainRef
   let
     barrier = (zero :: Vk.ImageMemoryBarrier2 '[])
@@ -1333,9 +1351,9 @@ transitionImageLayout
 --
 -- If the swapchain or framebuffer is stale (because the viewport is resized),
 -- 'recreateSwapchain' is called and the function returns 'False' to indicate that the frame index should not be advanced.
-drawFrame :: Int -> MonadApplication Bool
+drawFrame :: (MonadApplication m) => Int -> m Bool
 drawFrame frameIndex = do
-  Application{..} <- ask
+  ApplicationEnv{..} <- ask
   let frame = frames Vector.! frameIndex
   let drawFences = Vector.singleton frame.inFlightFence
   Vk.waitForFences device drawFences True maxBound
@@ -1357,9 +1375,9 @@ drawFrame frameIndex = do
         assert (imageIndexResult == Vk.TIMEOUT || imageIndexResult == Vk.NOT_READY) imageIndexResult
       pure False
  where
-  continue :: Vector Vk.Fence -> Word32 -> Frame -> Swapchain -> MonadApplication Bool
+  continue :: (MonadApplication m) => Vector Vk.Fence -> Word32 -> Frame -> Swapchain -> m Bool
   continue drawFences imageIndex frame swapchain = do
-    Application{..} <- ask
+    ApplicationEnv{..} <- ask
 
     updateUniformBuffer frame
 
@@ -1410,9 +1428,9 @@ drawFrame frameIndex = do
 -- The camera is located at (2, 2, 2), and looks towards the origin.
 --
 -- The FOV is set at 45 degrees and y-flipped for Vulkan.
-updateUniformBuffer :: Frame -> MonadApplication ()
+updateUniformBuffer :: (MonadApplication m) => Frame -> m ()
 updateUniformBuffer frame = do
-  Application{startTime, swapchainRef} <- ask
+  ApplicationEnv{startTime, swapchainRef} <- ask
   currentTime <- liftIO Time.getCurrentTime
   swapchain <- readIORef swapchainRef
   let
@@ -1443,7 +1461,7 @@ catchOutOfDate action =
     else throwIO exn
 
 -- | Releases the swapchain's image views and the swapchain.
-cleanupSwapchain :: Vector ReleaseKey -> ReleaseKey -> ResIO ()
+cleanupSwapchain :: (MonadResource m) => Vector ReleaseKey -> ReleaseKey -> m ()
 cleanupSwapchain swapchainImageViewsReleaseKeys swapchainReleaseKey = do
   traverse_ release swapchainImageViewsReleaseKeys
   release swapchainReleaseKey
@@ -1453,9 +1471,9 @@ cleanupSwapchain swapchainImageViewsReleaseKeys swapchainReleaseKey = do
 -- This function should be called whenever the application is resized.
 --
 -- If the application is minimized, the application is paused.
-recreateSwapchain :: MonadApplication ()
+recreateSwapchain :: (MonadApplication m) => m ()
 recreateSwapchain = do
-  Application{..} <- ask
+  ApplicationEnv{..} <- ask
 
   -- Pause while minimized
   liftIO $ whileM_
@@ -1464,20 +1482,19 @@ recreateSwapchain = do
 
   Vk.deviceWaitIdle device
 
-  MonadApplication $ lift do
-    do
-      Swapchain{..} <- readIORef swapchainRef
-      cleanupSwapchain imageViewsReleaseKeys releaseKey
-    (releaseKey, swapchain, surfaceFormat, images, extent) <-
-      createSwapchain device physicalDevice surface window
-    (imageViewsReleaseKeys, imageViews) <-
-      createImageViews device surfaceFormat images
-    writeIORef swapchainRef Swapchain{..}
+  do
+    Swapchain{..} <- readIORef swapchainRef
+    cleanupSwapchain imageViewsReleaseKeys releaseKey
+  (releaseKey, swapchain, surfaceFormat, images, extent) <-
+    createSwapchain device physicalDevice surface window
+  (imageViewsReleaseKeys, imageViews) <-
+    createImageViews device surfaceFormat images
+  writeIORef swapchainRef Swapchain{..}
 
 -- | While the window should not close, pools events and renders frames.
-mainLoop :: MonadApplication ()
+mainLoop :: (MonadApplication m) => m ()
 mainLoop = do
-  Application{window} <- ask
+  ApplicationEnv{window} <- ask
   frameIndexRef <- newIORef 0
   whileM_ (liftIO $ not <$> GLFW.windowShouldClose window) do
     frameIndex <- readIORef frameIndexRef
@@ -1490,9 +1507,9 @@ mainLoop = do
 defaultMain :: IO ()
 defaultMain = catch
   (runResourceT do
-    application <- initVulkan enableValidationLayers defaultWidth defaultHeight
-    flip runReaderT application $ (.runMonadApplication) do
-      mainLoop `finally` Vk.deviceWaitIdle application.device)
+    applicationEnv <- initVulkan enableValidationLayers defaultWidth defaultHeight
+    flip runReaderT applicationEnv $ (.runApplication) @(Application _) do
+      mainLoop `finally` Vk.deviceWaitIdle applicationEnv.device)
   \(err :: SomeException) ->
     hPutStrLn stderr $ displayException err
  where

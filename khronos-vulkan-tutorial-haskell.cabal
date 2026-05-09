@@ -38,10 +38,12 @@ library
       src
   default-extensions:
       BlockArguments
+      ConstraintKinds
       DataKinds
       DeriveAnyClass
       DerivingStrategies
       DuplicateRecordFields
+      FlexibleContexts
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
@@ -90,10 +92,12 @@ executable khronos-vulkan-tutorial-haskell-exe
       app
   default-extensions:
       BlockArguments
+      ConstraintKinds
       DataKinds
       DeriveAnyClass
       DerivingStrategies
       DuplicateRecordFields
+      FlexibleContexts
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
@@ -129,10 +133,12 @@ test-suite khronos-vulkan-tutorial-haskell-test
       test
   default-extensions:
       BlockArguments
+      ConstraintKinds
       DataKinds
       DeriveAnyClass
       DerivingStrategies
       DuplicateRecordFields
+      FlexibleContexts
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
