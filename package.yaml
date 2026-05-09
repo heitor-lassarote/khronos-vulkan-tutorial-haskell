@@ -19,6 +19,14 @@ category:            Graphics
 # common to point users to the README.md file.
 description:         Please see the README on GitHub at <https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell#readme>
 
+build-type: Custom
+
+custom-setup:
+  dependencies:
+  - base
+  - Cabal
+  - process
+
 dependencies:
 - base >= 4.7 && < 5
 

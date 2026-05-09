@@ -16,7 +16,7 @@ maintainer:     heitortoledo at hotmail dot com
 copyright:      2026 Heitor Toledo Lassarote de Paula
 license:        BSD-3-Clause
 license-file:   LICENSE
-build-type:     Simple
+build-type:     Custom
 extra-source-files:
     README.md
     CHANGELOG.md
@@ -24,6 +24,12 @@ extra-source-files:
 source-repository head
   type: git
   location: https://github.com/heitor-lassarote/khronos-vulkan-tutorial-haskell
+
+custom-setup
+  setup-depends:
+      Cabal
+    , base
+    , process
 
 library
   exposed-modules:
