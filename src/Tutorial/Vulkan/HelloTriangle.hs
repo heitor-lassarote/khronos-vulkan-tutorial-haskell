@@ -1,7 +1,7 @@
 module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 
 import Codec.Picture                (Image (..), convertRGBA8, readImage)
-import Control.Lens                 (Lens', _1, view, (%~), (&))
+import Control.Lens                 (Lens', _1, view)
 import Control.Monad                (unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
@@ -18,6 +18,7 @@ import Data.Maybe                   (fromJust, fromMaybe, isJust)
 import Data.Ord                     (clamp)
 import Data.Time                    (UTCTime)
 import Data.Time                    qualified as Time
+import Data.Traversable             (for)
 import Data.Vector                  (Vector)
 import Data.Vector                  qualified as Vector
 import Data.Vector.Storable         qualified as SVector
@@ -39,7 +40,7 @@ import Vulkan.CStruct.Extends       (SomeStruct (..), pattern (:&))
 import Vulkan.Exception             (VulkanException (..))
 import Vulkan.Zero                  (zero)
 
-import Tutorial.Vulkan.Utils        (iFindIndex, iFindIndexM)
+import Tutorial.Vulkan.Utils        (findM, iFindIndex, iFindIndexM, perspectiveVulkan)
 import Tutorial.Vulkan.Vertex       (Index (..), Vertex (..))
 import Tutorial.Vulkan.Vertex       qualified as Vertex
 
@@ -59,11 +60,13 @@ data Frame = Frame
 
 type Swapchain :: Type
 data Swapchain = Swapchain
-  { swapchain             :: Vk.SwapchainKHR
-  , surfaceFormat         :: Vk.SurfaceFormatKHR
-  , images                :: Vector Vk.Image
-  , extent                :: Vk.Extent2D
-  , imageViews            :: Vector Vk.ImageView
+  { swapchain      :: Vk.SwapchainKHR
+  , surfaceFormat  :: Vk.SurfaceFormatKHR
+  , images         :: Vector Vk.Image
+  , extent         :: Vk.Extent2D
+  , imageViews     :: Vector Vk.ImageView
+  , depthImage     :: Vk.Image
+  , depthImageView :: Vk.ImageView
   }
 
 type UniformBufferObject :: Type
@@ -510,7 +513,9 @@ createSwapchain device physicalDevice surface window = do
       Vk.getSwapchainImagesKHR device swapchain
   pure (swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent)
 
--- | Creates the views into the images obtained by 'createSwapchain' alongside their release keys.
+-- | Creates the views into the images obtained by 'createSwapchain'.
+--
+-- The images are allocated in the swapchain scope to be released.
 --
 -- See 'createImageView'.
 createImageViews
@@ -520,9 +525,8 @@ createImageViews
   -> Vector Vk.Image
   -> m (Vector Vk.ImageView)
 createImageViews device swapchainSurfaceFormat swapchainImages =
-  traverse
-    (\image -> createImageView device image swapchainSurfaceFormat.format SwapchainAllocatorScope)
-    swapchainImages
+  for swapchainImages \image ->
+    createImageView device image swapchainSurfaceFormat.format Vk.IMAGE_ASPECT_COLOR_BIT SwapchainAllocatorScope
 
 -- | Creates a descriptor set layout with two layouts:
 --
@@ -561,26 +565,34 @@ createShaderModule device code = do
     (Vk.createShaderModule device createInfo Nothing)
     (flip (Vk.destroyShaderModule device) Nothing)
 
--- | Describes the vertices of a square ranging from (-0.5, -0.5) to (0.5, 0.5).
+-- | Describes the vertices of two squares ranging from (-0.5, -0.5, z) to (0.5, 0.5, z), with z in {0, -0.5}.
 --
--- The colors are (top-left, clockwise): red, green, blue, white.
+-- The colors (ignored for now) are (top-left, clockwise): red, green, blue, white.
 --
 -- The texture coordinates (UV) simply go from (0, 0) in the top-left corner to (1, 1) in the bottom-right corner.
 --
 -- The vertices are linked by 'indices'.
 vertices :: SVector.Vector Vertex
 vertices = SVector.fromList
-  [ Vertex (Linear.V2 -0.5 -0.5) (Linear.V3 1 0 0) (Linear.V2 1 0)
-  , Vertex (Linear.V2  0.5 -0.5) (Linear.V3 0 1 0) (Linear.V2 0 0)
-  , Vertex (Linear.V2  0.5  0.5) (Linear.V3 0 0 1) (Linear.V2 0 1)
-  , Vertex (Linear.V2 -0.5  0.5) (Linear.V3 1 1 1) (Linear.V2 1 1)
+  [ Vertex (Linear.V3 -0.5 -0.5  0.0) (Linear.V3 1 0 0) (Linear.V2 1 0)
+  , Vertex (Linear.V3  0.5 -0.5  0.0) (Linear.V3 0 1 0) (Linear.V2 0 0)
+  , Vertex (Linear.V3  0.5  0.5  0.0) (Linear.V3 0 0 1) (Linear.V2 0 1)
+  , Vertex (Linear.V3 -0.5  0.5  0.0) (Linear.V3 1 1 1) (Linear.V2 1 1)
+
+  , Vertex (Linear.V3 -0.5 -0.5 -0.5) (Linear.V3 1 0 0) (Linear.V2 1 0)
+  , Vertex (Linear.V3  0.5 -0.5 -0.5) (Linear.V3 0 1 0) (Linear.V2 0 0)
+  , Vertex (Linear.V3  0.5  0.5 -0.5) (Linear.V3 0 0 1) (Linear.V2 0 1)
+  , Vertex (Linear.V3 -0.5  0.5 -0.5) (Linear.V3 1 1 1) (Linear.V2 1 1)
   ]
 
--- | Describes two triangles from 'vertices'.
+-- | Describes the geometry from 'vertices'.
 indices :: SVector.Vector Index
 indices = SVector.fromList
   [ 0, 1, 2
   , 2, 3, 0
+
+  , 4, 5, 6
+  , 6, 7, 4
   ]
 
 -- | Creates the full graphics pipeline, rendering the pipeline layout and pipeline:
@@ -593,10 +605,12 @@ indices = SVector.fromList
 --         * Disabled blending.
 --         * Dynamic viewport and scissor.
 --     * Sets dynamic rendering.
+--     * Sets the depth stencil.
 createGraphicsPipeline
-  :: (MonadScopedAllocator r m) => Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
   -> m (Vk.PipelineLayout, Vk.Pipeline)
-createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
+createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
   let
@@ -657,12 +671,21 @@ createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
       , Vk.attachments = Vector.singleton colorBlendAttachment
       }
 
+    depthStencil = (zero :: Vk.PipelineDepthStencilStateCreateInfo)
+      { Vk.depthTestEnable = True
+      , Vk.depthWriteEnable = True
+      , Vk.depthCompareOp = Vk.COMPARE_OP_LESS
+      , Vk.depthBoundsTestEnable = False
+      , Vk.stencilTestEnable = False
+      }
+
     pipelineLayoutInfo = (zero :: Vk.PipelineLayoutCreateInfo)
       { Vk.setLayouts = Vector.singleton descriptorSetLayout
       , Vk.pushConstantRanges = Vector.empty
       }
   pipelineLayout <- Vk.withPipelineLayout device pipelineLayoutInfo Nothing (allocate' GlobalAllocatorScope)
 
+  depthFormat <- liftIO $ findDepthFormat physicalDevice
   let
     pipelineCreateInfoChain = (zero :: Vk.GraphicsPipelineCreateInfo '[])
       { Vk.stageCount = 2
@@ -676,8 +699,10 @@ createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
       , Vk.dynamicState = Just dynamicState
       , Vk.layout = pipelineLayout
       , Vk.renderPass = Vk.NULL_HANDLE
+      , Vk.depthStencilState = Just depthStencil
       , Vk.next = (zero :: Vk.PipelineRenderingCreateInfo)
         { Vk.colorAttachmentFormats = Vector.singleton swapchainSurfaceFormat.format
+        , Vk.depthAttachmentFormat = depthFormat
         }
         :& ()
       }
@@ -705,6 +730,55 @@ createCommandPool device queueIndex = do
       , Vk.queueFamilyIndex = queueIndex
       }
   Vk.withCommandPool device poolInfo Nothing (allocate' GlobalAllocatorScope)
+
+-- | Creates a depth image for use with a depth stencil as well as its image view.
+createDepthResources
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.Extent2D
+  -> m (Vk.Image, Vk.ImageView)
+createDepthResources physicalDevice device swapchainExtent = do
+  depthFormat <- liftIO $ findDepthFormat physicalDevice
+  (depthImage, _depthImageMemory) <- createImage
+    physicalDevice
+    device
+    swapchainExtent.width
+    swapchainExtent.height
+    depthFormat
+    Vk.IMAGE_TILING_OPTIMAL
+    Vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+    Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    SwapchainAllocatorScope
+  depthImageView <- createImageView device depthImage depthFormat Vk.IMAGE_ASPECT_DEPTH_BIT SwapchainAllocatorScope
+  pure (depthImage, depthImageView)
+
+-- | Finds a format among the candidate formats satisfying the image tiling or throws an error if none are supported.
+--
+-- The only supported formats are linear and optimal.
+findSupportedFormat
+  :: Vk.PhysicalDevice -> Vector Vk.Format -> Vk.ImageTiling -> Vk.FormatFeatureFlags
+  -> IO Vk.Format
+findSupportedFormat physicalDevice candidates tiling features = do
+  formatM <- findM
+    (\format -> do
+      props <- Vk.getPhysicalDeviceFormatProperties physicalDevice format
+      pure
+        $  tiling == Vk.IMAGE_TILING_LINEAR && (props.linearTilingFeatures .&. features) == features
+        || tiling == Vk.IMAGE_TILING_OPTIMAL && (props.optimalTilingFeatures .&. features) == features)
+    candidates
+  maybe
+    (throwIO $ RuntimeError "Failed to find supported format!")
+    pure
+    formatM
+
+-- | Finds a format that is optimal for the depth stencil.
+--
+-- See 'findSupportedFormat'.
+findDepthFormat :: Vk.PhysicalDevice -> IO Vk.Format
+findDepthFormat physicalDevice = findSupportedFormat
+  physicalDevice
+  (Vector.fromList [Vk.FORMAT_D32_SFLOAT, Vk.FORMAT_D32_SFLOAT_S8_UINT, Vk.FORMAT_D24_UNORM_S8_UINT])
+  Vk.IMAGE_TILING_OPTIMAL
+  Vk.FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
 
 -- | Loads a texture from the disk (./khronos-vulkan-tutorial-cpp/images/texture.jpg) in RGBA8 format.
 --
@@ -740,6 +814,7 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
         Vk.IMAGE_TILING_OPTIMAL
         (Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
         Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        GlobalAllocatorScope
 
       transitionImageLayout'
         device
@@ -772,12 +847,15 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
 -- | Creates a 2D image with undefined layout and no multisampling.
 --
 -- Returns the allocated image and image memory.
+--
+-- The allocator scope indicates where to allocate these objects.
 createImage
   :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device
   -> Word32 -> Word32
   -> Vk.Format -> Vk.ImageTiling -> Vk.ImageUsageFlags -> Vk.MemoryPropertyFlags
+  -> AllocatorScope
   -> m (Vk.Image, Vk.DeviceMemory)
-createImage physicalDevice device width height format tiling usage properties = do
+createImage physicalDevice device width height format tiling usage properties scope = do
   let
     imageInfo = (zero :: Vk.ImageCreateInfo '[])
       { Vk.imageType = Vk.IMAGE_TYPE_2D
@@ -791,7 +869,7 @@ createImage physicalDevice device width height format tiling usage properties = 
       , Vk.sharingMode = Vk.SHARING_MODE_EXCLUSIVE
       , Vk.initialLayout = Vk.IMAGE_LAYOUT_UNDEFINED
       }
-  image <- Vk.withImage device imageInfo Nothing (allocate' GlobalAllocatorScope)
+  image <- Vk.withImage device imageInfo Nothing (allocate' scope)
 
   memRequirements <- Vk.getImageMemoryRequirements device image
   memoryTypeIndex <- findMemoryType physicalDevice memRequirements.memoryTypeBits properties
@@ -800,7 +878,7 @@ createImage physicalDevice device width height format tiling usage properties = 
       { Vk.allocationSize = memRequirements.size
       , Vk.memoryTypeIndex
       }
-  imageMemory <- Vk.withMemory device allocInfo Nothing (allocate' GlobalAllocatorScope)
+  imageMemory <- Vk.withMemory device allocInfo Nothing (allocate' scope)
   Vk.bindImageMemory device image imageMemory 0
 
   pure (image, imageMemory)
@@ -845,6 +923,8 @@ withSingleTimeCommands device commandPool graphicsQueue action = do
 --
 --     1. From undefined to transfer-dst (preparing to receive a copy).
 --     2. From transfer-dst to shader-read-only (making it available to the fragment shader after a copy).
+--
+-- This function is called @transitionImageLayout@ in the C++ tutorial.
 transitionImageLayout'
   :: (MonadScopedAllocator r m) => Vk.Device -> Vk.CommandPool -> Vk.Queue
   -> Vk.Image -> Vk.ImageLayout -> Vk.ImageLayout -> m ()
@@ -924,16 +1004,20 @@ copyBufferToImage device commandPool graphicsQueue buffer image width height =
 
 -- | Helper function to create an image view for a given image with a format.
 --
--- The image view each have one mip level, one array layer, and color aspect.
+-- The image view each have one mip level and one array layer.
+--
+-- The allocator scope indicates where to allocate these objects.
 createImageView
-  :: (MonadScopedAllocator r m) => Vk.Device -> Vk.Image -> Vk.Format -> AllocatorScope -> m Vk.ImageView
-createImageView device image format scope = do
+  :: (MonadScopedAllocator r m)
+  => Vk.Device -> Vk.Image -> Vk.Format -> Vk.ImageAspectFlags -> AllocatorScope
+  -> m Vk.ImageView
+createImageView device image format aspectFlags scope = do
   let
     imageViewCreateInfo = (zero :: Vk.ImageViewCreateInfo '[])
       { Vk.viewType = Vk.IMAGE_VIEW_TYPE_2D
       , Vk.format
       , Vk.subresourceRange = Vk.ImageSubresourceRange
-        { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
+        { Vk.aspectMask = aspectFlags
         , Vk.baseMipLevel = 0
         , Vk.levelCount = 1
         , Vk.baseArrayLayer = 0
@@ -947,7 +1031,7 @@ createImageView device image format scope = do
 -- See 'createImageView'.
 createTextureImageView :: (MonadScopedAllocator r m) => Vk.Device -> Vk.Image -> m Vk.ImageView
 createTextureImageView device textureImage =
-  createImageView device textureImage Vk.FORMAT_R8G8B8A8_SRGB GlobalAllocatorScope
+  createImageView device textureImage Vk.FORMAT_R8G8B8A8_SRGB Vk.IMAGE_ASPECT_COLOR_BIT GlobalAllocatorScope
 
 -- | Creates a texture sampler with linear filtering and repeat address mode.
 --
@@ -1228,9 +1312,10 @@ initVulkan enableValidationLayers width height = do
   swapchainImageViews <- createImageViews device swapchainSurfaceFormat swapchainImages
   descriptorSetLayout <- createDescriptorSetLayout device
   (pipelineLayout, graphicsPipeline) <-
-    createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat
+    createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
   textureImage <- createTextureImage physicalDevice device commandPool queue
+  (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent
   textureImageView <- createTextureImageView device textureImage
   textureSampler <- createTextureSampler device physicalDevice
   (vertexBuffer, vertexBufferMemory) <-
@@ -1263,6 +1348,8 @@ initVulkan enableValidationLayers width height = do
     , images = swapchainImages
     , extent = swapchainExtent
     , imageViews = swapchainImageViews
+    , depthImage
+    , depthImageView
     }
   allocations <- view allocatorEnvL
   pure ApplicationEnv{..}
@@ -1270,7 +1357,8 @@ initVulkan enableValidationLayers width height = do
 -- | Records a full frame.
 --
 --     * Transitions the image to color attachment.
---     * Begins dynamic rendering (clears to black).
+--     * Transitions the depth image to depth attachment.
+--     * Begins dynamic rendering (clears to black, also clear the depth stencil).
 --     * Binds the pipeline.
 --     * Sets dynamic viewport/scissor.
 --     * Binds vertex/input buffers and the descriptor set.
@@ -1280,33 +1368,54 @@ initVulkan enableValidationLayers width height = do
 recordCommandBuffer :: (MonadApplication r m) => Word32 -> Frame -> m ()
 recordCommandBuffer imageIndex frame = do
   ApplicationEnv{..} <- view applicationEnvL
+  swapchain <- readIORef swapchainRef
+  let image = swapchain.images Vector.! fromIntegral imageIndex
 
   Vk.beginCommandBuffer frame.commandBuffer zero
 
   transitionImageLayout
-    imageIndex
+    image
     Vk.IMAGE_LAYOUT_UNDEFINED
     Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
     zero
     Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+    Vk.IMAGE_ASPECT_COLOR_BIT
+    frame
+  transitionImageLayout
+    swapchain.depthImage
+    Vk.IMAGE_LAYOUT_UNDEFINED
+    Vk.IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+    Vk.ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+    Vk.ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+    (Vk.PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT .|. Vk.PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
+    (Vk.PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT .|. Vk.PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
+    Vk.IMAGE_ASPECT_DEPTH_BIT
     frame
 
-  swapchain <- readIORef swapchainRef
   let
     clearColor = Vk.Color $ Vk.Float32 0 0 0 1
-    attachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
+    clearDepth = Vk.DepthStencil $ Vk.ClearDepthStencilValue 1 0
+    colorAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
       { Vk.imageView = swapchain.imageViews Vector.! fromIntegral imageIndex
       , Vk.imageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
       , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
       , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
       , Vk.clearValue = clearColor
       }
+    depthAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
+      { Vk.imageView = swapchain.depthImageView
+      , Vk.imageLayout = Vk.IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+      , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
+      , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
+      , Vk.clearValue = clearDepth
+      }
     renderingInfo = (zero :: Vk.RenderingInfo '[])
       { Vk.renderArea = zero{Vk.offset = Vk.Offset2D 0 0, Vk.extent = swapchain.extent}
       , Vk.layerCount = 1
-      , Vk.colorAttachments = Vector.singleton attachmentInfo
+      , Vk.colorAttachments = Vector.singleton colorAttachmentInfo
+      , Vk.depthAttachment = Just depthAttachmentInfo
       }
 
   Vk.cmdBeginRendering frame.commandBuffer renderingInfo
@@ -1332,40 +1441,43 @@ recordCommandBuffer imageIndex frame = do
   Vk.cmdEndRendering frame.commandBuffer
 
   transitionImageLayout
-    imageIndex
+    image
     Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
     Vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
     Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
     zero
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     Vk.PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT
+    Vk.IMAGE_ASPECT_COLOR_BIT
     frame
 
   Vk.endCommandBuffer frame.commandBuffer
 
 -- | Records a pipeline barrier to transition a swapchain image between two layouts with the specified access masks and pipeline stage masks.
+--
+-- This function is called @transition_image_layout@ in the C++ tutorial.
 transitionImageLayout
   :: (MonadApplication r m)
-  => Word32
+  => Vk.Image
   -> Vk.ImageLayout
   -> Vk.ImageLayout
   -> Vk.AccessFlags2
   -> Vk.AccessFlags2
   -> Vk.PipelineStageFlags2
   -> Vk.PipelineStageFlags2
+  -> Vk.ImageAspectFlags
   -> Frame
   -> m ()
 transitionImageLayout
-    imageIndex
+    image
     oldLayout
     newLayout
     srcAccessMask
     dstAccessMask
     srcStageMask
     dstStageMask
+    imageAspectFlags
     frame = do
-  ApplicationEnv{swapchainRef} <- view applicationEnvL
-  swapchain <- readIORef swapchainRef
   let
     barrier = (zero :: Vk.ImageMemoryBarrier2 '[])
       { Vk.srcStageMask
@@ -1376,9 +1488,9 @@ transitionImageLayout
       , Vk.newLayout
       , Vk.srcQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
       , Vk.dstQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
-      , Vk.image = swapchain.images Vector.! fromIntegral imageIndex
+      , Vk.image = image
       , Vk.subresourceRange = zero
-        { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
+        { Vk.aspectMask = imageAspectFlags
         , Vk.baseMipLevel = 0
         , Vk.levelCount = 1
         , Vk.baseArrayLayer = 0
@@ -1491,13 +1603,11 @@ updateUniformBuffer frame = do
       (Linear.axisAngle (Linear.V3 0 0 1) (time * pi / 2))
       (Linear.V3 0 0 0)
     view' = Linear.transpose $ Linear.lookAt (Linear.V3 2 2 2) (Linear.V3 0 0 0) (Linear.V3 0 0 1)
-    projFlipped = Linear.transpose $ Linear.perspective
+    proj = Linear.transpose $ perspectiveVulkan
       (pi / 4)
       (realToFrac swapchain.extent.width / realToFrac swapchain.extent.height)
       0.1
       10
-    -- We negate the y coordinate's scaling factor because Vulkan's y axis points down.
-    proj = projFlipped & Linear._y . Linear._y %~ negate
     ubo = UniformBufferObject{view = view', ..}
   liftIO $ poke frame.uniformBufferMapped ubo
 
@@ -1539,6 +1649,7 @@ recreateSwapchain = do
   (swapchain, surfaceFormat, images, extent) <-
     createSwapchain device physicalDevice surface window
   imageViews <- createImageViews device surfaceFormat images
+  (depthImage, depthImageView) <- createDepthResources physicalDevice device extent
   writeIORef swapchainRef Swapchain{..}
 
 -- | While the window should not close, pools events and renders frames.

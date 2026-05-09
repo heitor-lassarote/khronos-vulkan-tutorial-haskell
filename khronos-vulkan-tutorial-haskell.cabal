@@ -49,6 +49,7 @@ library
       LambdaCase
       LexicalNegation
       MultiParamTypeClasses
+      MultiWayIf
       NamedFieldPuns
       NoFieldSelectors
       OverloadedRecordDot
@@ -103,6 +104,7 @@ executable khronos-vulkan-tutorial-haskell-exe
       LambdaCase
       LexicalNegation
       MultiParamTypeClasses
+      MultiWayIf
       NamedFieldPuns
       NoFieldSelectors
       OverloadedRecordDot
@@ -144,6 +146,7 @@ test-suite khronos-vulkan-tutorial-haskell-test
       LambdaCase
       LexicalNegation
       MultiParamTypeClasses
+      MultiWayIf
       NamedFieldPuns
       NoFieldSelectors
       OverloadedRecordDot

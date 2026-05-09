@@ -16,7 +16,7 @@ import Vulkan           qualified as Vk
 
 type Vertex :: Type
 data Vertex = Vertex
-  { pos      :: Linear.V2 Float
+  { pos      :: Linear.V3 Float
   , color    :: Linear.V3 Float
   , texCoord :: Linear.V2 Float
   }
@@ -30,22 +30,22 @@ indexType = Vk.INDEX_TYPE_UINT16
 
 instance Storable Vertex where
   sizeOf _ =
-    2 * sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)
+    2 * sizeOf (undefined :: Linear.V3 Float) + sizeOf (undefined :: Linear.V2 Float)
 
   alignment _ = alignment (undefined :: Float)
 
   peek ptr = do
     let p = castPtr ptr
     pos <- peek p
-    color <- peekByteOff p (sizeOf (undefined :: Linear.V2 Float))
-    texCoord <- peekByteOff p (sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float))
+    color <- peekByteOff p (sizeOf (undefined :: Linear.V3 Float))
+    texCoord <- peekByteOff p (2 * sizeOf (undefined :: Linear.V3 Float))
     pure Vertex{..}
 
   poke ptr Vertex{..} = do
     let p = castPtr ptr
     poke p pos
-    pokeByteOff p (sizeOf (undefined :: Linear.V2 Float)) color
-    pokeByteOff p (sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)) texCoord
+    pokeByteOff p (sizeOf (undefined :: Linear.V3 Float)) color
+    pokeByteOff p (2 * sizeOf (undefined :: Linear.V3 Float)) texCoord
 
 getBindingDescription :: Vk.VertexInputBindingDescription
 getBindingDescription = Vk.VertexInputBindingDescription
@@ -57,15 +57,15 @@ getBindingDescription = Vk.VertexInputBindingDescription
 getAttributeDescriptions :: Vector Vk.VertexInputAttributeDescription
 getAttributeDescriptions = Vector.fromList
   [ Vk.VertexInputAttributeDescription
-    { Vk.location = 0, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32_SFLOAT
+    { Vk.location = 0, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32B32_SFLOAT
     , Vk.offset = 0
     }
   , Vk.VertexInputAttributeDescription
     { Vk.location = 1, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32B32_SFLOAT
-    , Vk.offset = fromIntegral $ sizeOf (undefined :: Linear.V2 Float)
+    , Vk.offset = fromIntegral $ sizeOf (undefined :: Linear.V3 Float)
     }
   , Vk.VertexInputAttributeDescription
     { Vk.location = 2, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32_SFLOAT
-    , Vk.offset = fromIntegral $ sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V3 Float)
+    , Vk.offset = fromIntegral $ 2 * sizeOf (undefined :: Linear.V3 Float)
     }
   ]
