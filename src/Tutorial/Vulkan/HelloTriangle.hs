@@ -71,6 +71,8 @@ data Swapchain = Swapchain
   , imageViews     :: Vector Vk.ImageView
   , depthImage     :: Vk.Image
   , depthImageView :: Vk.ImageView
+  , colorImage     :: Vk.Image
+  , colorImageView :: Vk.ImageView
   }
 
 type UniformBufferObject :: Type
@@ -152,6 +154,7 @@ data ApplicationEnv = ApplicationEnv
   , allocations              :: AllocatorEnv
   , vertices                 :: SVector.Vector Vertex
   , indices                  :: SVector.Vector Index
+  , msaaSamples              :: Vk.SampleCountFlagBits
   }
 
 type HasApplicationEnv :: Type -> Constraint
@@ -252,10 +255,10 @@ makeVersion :: Word32 -> Word32 -> Word32 -> Word32
 makeVersion major minor patch = major `shift` 22 .|. minor `shift` 12 .|. patch
 
 -- | Enumerates the required Vulkan extensions from GLFW and optionally the validation layer.
-getRequiredInstanceExtensions :: Bool -> IO (Vector ByteString)
+getRequiredInstanceExtensions :: (MonadIO m) => Bool -> m (Vector ByteString)
 getRequiredInstanceExtensions enableValidationLayers = do
   glfwExtensions <-
-    traverse (fmap BS.pack . peekCString) . Vector.fromList =<< GLFW.getRequiredInstanceExtensions
+    traverse (fmap BS.pack . peekCString) . Vector.fromList =<< liftIO GLFW.getRequiredInstanceExtensions
   extensionProperties <-
     withResultCheck "Error enumerating instance extension properties" $
       Vk.enumerateInstanceExtensionProperties Nothing
@@ -277,7 +280,7 @@ createInstance enableValidationLayers = do
       Nothing -> pure ()
       Just layerName -> throwIO $ RuntimeError $ "Unsupported required layer: " <> BS.unpack layerName
 
-  glfwExtensions <- liftIO $ getRequiredInstanceExtensions enableValidationLayers
+  glfwExtensions <- getRequiredInstanceExtensions enableValidationLayers
 
   let
     appInfo = zero
@@ -321,17 +324,37 @@ setupDebugMessenger enableValidationLayers inst =
     .|. Vk.DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT
     .|. Vk.DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
 
+-- | Queries the physical device for the maximum sample count for multisampling.
+--
+-- The device should support this for color and depth framebuffers.
+--
+-- If multisampling is not supported, defaults to 1 (multisampling disabled).
+getMaxUsableSampleCount :: (MonadIO m) => Vk.PhysicalDevice -> m Vk.SampleCountFlagBits
+getMaxUsableSampleCount physicalDevice = do
+  physicalDeviceProperties <- Vk.getPhysicalDeviceProperties physicalDevice
+  let
+    counts =
+      physicalDeviceProperties.limits.framebufferColorSampleCounts
+      .&. physicalDeviceProperties.limits.framebufferDepthSampleCounts
+    countM = find
+      (\count -> counts .&. count /= zeroBits)
+      [ Vk.SAMPLE_COUNT_64_BIT, Vk.SAMPLE_COUNT_32_BIT, Vk.SAMPLE_COUNT_16_BIT
+      , Vk.SAMPLE_COUNT_8_BIT, Vk.SAMPLE_COUNT_4_BIT, Vk.SAMPLE_COUNT_2_BIT
+      ]
+  pure $ fromMaybe Vk.SAMPLE_COUNT_1_BIT countM
+
 -- | Picks the first physical device (GPU) that supports:
 --
 --     1. Vulkan API 1.3 or greater.
 --     2. Graphics queues.
 --     3. The swapchain extension.
 --     4. Sampler anisotropy.
---     5. Shaders.
---     6. Dynamic rendering.
---     7. @synchronization2@.
---     8. Extended dynamic state.
-pickPhysicalDevice :: Vk.Instance -> IO Vk.PhysicalDevice
+--     5. Sample rate shading.
+--     6. Shaders.
+--     7. Dynamic rendering.
+--     8. @synchronization2@.
+--     9. Extended dynamic state.
+pickPhysicalDevice :: (MonadIO m) => Vk.Instance -> m Vk.PhysicalDevice
 pickPhysicalDevice inst = do
   physicalDevices <-
     withResultCheck "Error enumerating physical devices" $
@@ -369,6 +392,7 @@ pickPhysicalDevice inst = do
         :& ()) = features.next
       supportsRequiredFeatures =
         supportedFeatures.samplerAnisotropy
+        && supportedFeatures.sampleRateShading
         && physicalDeviceVulkan11Features.shaderDrawParameters
         && physicalDeviceVulkan13Features.dynamicRendering
         && physicalDeviceVulkan13Features.synchronization2
@@ -411,6 +435,7 @@ createLogicalDevice physicalDevice surface = do
       (zero :: Vk.PhysicalDeviceFeatures2 '[])
         { Vk.features = (zero :: Vk.PhysicalDeviceFeatures)
           { Vk.samplerAnisotropy = True
+          , Vk.sampleRateShading = True
           }
         }
       :& (zero :: Vk.PhysicalDeviceVulkan11Features)
@@ -587,13 +612,15 @@ createShaderModule device code = do
 --         * Counter-clockwise winding.
 --         * Disabled blending.
 --         * Dynamic viewport and scissor.
+--     * Enables multisampling with the provided sample counts and a value of 0.2 for sample shading.
 --     * Sets dynamic rendering.
 --     * Sets the depth stencil.
 createGraphicsPipeline
   :: (MonadScopedAllocator r m)
   => Vk.PhysicalDevice -> Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
+  -> Vk.SampleCountFlagBits
   -> m (Vk.PipelineLayout, Vk.Pipeline)
-createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat = do
+createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
   let
@@ -636,8 +663,9 @@ createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfac
       , Vk.lineWidth = 1
       }
     multisampling = (zero :: Vk.PipelineMultisampleStateCreateInfo '[])
-      { Vk.rasterizationSamples = Vk.SAMPLE_COUNT_1_BIT
-      , Vk.sampleShadingEnable = False
+      { Vk.rasterizationSamples = msaaSamples
+      , Vk.sampleShadingEnable = True
+      , Vk.minSampleShading = 0.2 -- min fraction for sample shading; closer to one is smoother
       }
     colorBlendAttachment = (zero :: Vk.PipelineColorBlendAttachmentState)
       { Vk.blendEnable = False
@@ -668,7 +696,7 @@ createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfac
       }
   pipelineLayout <- Vk.withPipelineLayout device pipelineLayoutInfo Nothing (allocate' GlobalAllocatorScope)
 
-  depthFormat <- liftIO $ findDepthFormat physicalDevice
+  depthFormat <- findDepthFormat physicalDevice
   let
     pipelineCreateInfoChain = (zero :: Vk.GraphicsPipelineCreateInfo '[])
       { Vk.stageCount = 2
@@ -714,13 +742,38 @@ createCommandPool device queueIndex = do
       }
   Vk.withCommandPool device poolInfo Nothing (allocate' GlobalAllocatorScope)
 
+-- | Creates a depth image for use with the color buffer (for multisampling) as well as its image view.
+createColorResources
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR
+  -> Vk.SampleCountFlagBits
+  -> m (Vk.Image, Vk.ImageView)
+createColorResources physicalDevice device swapchainExtent swapchainSurfaceFormat msaaSamples = do
+  let colorFormat = swapchainSurfaceFormat.format
+  (colorImage, _colorImageMemory) <- createImage
+    physicalDevice
+    device
+    swapchainExtent.width
+    swapchainExtent.height
+    1
+    colorFormat
+    Vk.IMAGE_TILING_OPTIMAL
+    (Vk.IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT .|. Vk.IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+    Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    msaaSamples
+    SwapchainAllocatorScope
+  colorImageView <-
+    createImageView device colorImage 1 colorFormat Vk.IMAGE_ASPECT_COLOR_BIT SwapchainAllocatorScope
+  pure (colorImage, colorImageView)
+
 -- | Creates a depth image for use with a depth stencil as well as its image view.
 createDepthResources
   :: (MonadScopedAllocator r m)
   => Vk.PhysicalDevice -> Vk.Device -> Vk.Extent2D
+  -> Vk.SampleCountFlagBits
   -> m (Vk.Image, Vk.ImageView)
-createDepthResources physicalDevice device swapchainExtent = do
-  depthFormat <- liftIO $ findDepthFormat physicalDevice
+createDepthResources physicalDevice device swapchainExtent msaaSamples = do
+  depthFormat <- findDepthFormat physicalDevice
   let mipLevels = 1
   (depthImage, _depthImageMemory) <- createImage
     physicalDevice
@@ -732,6 +785,7 @@ createDepthResources physicalDevice device swapchainExtent = do
     Vk.IMAGE_TILING_OPTIMAL
     Vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
     Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    msaaSamples
     SwapchainAllocatorScope
   depthImageView <-
     createImageView device depthImage mipLevels depthFormat Vk.IMAGE_ASPECT_DEPTH_BIT SwapchainAllocatorScope
@@ -741,8 +795,9 @@ createDepthResources physicalDevice device swapchainExtent = do
 --
 -- The only supported formats are linear and optimal.
 findSupportedFormat
-  :: Vk.PhysicalDevice -> Vector Vk.Format -> Vk.ImageTiling -> Vk.FormatFeatureFlags
-  -> IO Vk.Format
+  :: (MonadIO m)
+  => Vk.PhysicalDevice -> Vector Vk.Format -> Vk.ImageTiling -> Vk.FormatFeatureFlags
+  -> m Vk.Format
 findSupportedFormat physicalDevice candidates tiling features = do
   formatM <- findM
     (\format -> do
@@ -759,7 +814,7 @@ findSupportedFormat physicalDevice candidates tiling features = do
 -- | Finds a format that is optimal for the depth stencil.
 --
 -- See 'findSupportedFormat'.
-findDepthFormat :: Vk.PhysicalDevice -> IO Vk.Format
+findDepthFormat :: (MonadIO m) => Vk.PhysicalDevice -> m Vk.Format
 findDepthFormat physicalDevice = findSupportedFormat
   physicalDevice
   (Vector.fromList [Vk.FORMAT_D32_SFLOAT, Vk.FORMAT_D32_SFLOAT_S8_UINT, Vk.FORMAT_D24_UNORM_S8_UINT])
@@ -803,6 +858,7 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
         Vk.IMAGE_TILING_OPTIMAL
         (Vk.IMAGE_USAGE_TRANSFER_SRC_BIT .|. Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
         Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        Vk.SAMPLE_COUNT_1_BIT
         GlobalAllocatorScope
 
       transitionImageLayout'
@@ -950,7 +1006,7 @@ generateMipmaps physicalDevice device commandPool graphicsQueue image imageForma
       Vector.empty
       (Vector.singleton $ SomeStruct barrier')
 
--- | Creates a 2D image with undefined layout and no multisampling.
+-- | Creates a 2D image with undefined layout and the provided number of samples for multisampling.
 --
 -- Returns the allocated image and image memory.
 --
@@ -959,9 +1015,9 @@ createImage
   :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device
   -> Word32 -> Word32 -> Word32
   -> Vk.Format -> Vk.ImageTiling -> Vk.ImageUsageFlags -> Vk.MemoryPropertyFlags
-  -> AllocatorScope
+  -> Vk.SampleCountFlags -> AllocatorScope
   -> m (Vk.Image, Vk.DeviceMemory)
-createImage physicalDevice device width height mipLevels format tiling usage properties scope = do
+createImage physicalDevice device width height mipLevels format tiling usage properties numSamples scope = do
   let
     imageInfo = (zero :: Vk.ImageCreateInfo '[])
       { Vk.imageType = Vk.IMAGE_TYPE_2D
@@ -970,7 +1026,7 @@ createImage physicalDevice device width height mipLevels format tiling usage pro
       , Vk.extent = Vk.Extent3D width height 1
       , Vk.mipLevels
       , Vk.arrayLayers = 1
-      , Vk.samples = Vk.SAMPLE_COUNT_1_BIT
+      , Vk.samples = numSamples
       , Vk.usage
       , Vk.sharingMode = Vk.SHARING_MODE_EXCLUSIVE
       , Vk.initialLayout = Vk.IMAGE_LAYOUT_UNDEFINED
@@ -1060,7 +1116,7 @@ transitionImageLayout' device commandPool graphicsQueue image mipLevels oldLayou
         , Vk.oldLayout
         , Vk.newLayout
         , Vk.image
-        , Vk.subresourceRange = zero
+        , Vk.subresourceRange = Vk.ImageSubresourceRange
           { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
           , Vk.baseMipLevel = 0
           , Vk.levelCount = mipLevels
@@ -1129,8 +1185,9 @@ createImageView device image mipLevels format aspectFlags scope = do
         , Vk.baseArrayLayer = 0
         , Vk.layerCount = 1
         }
+      , Vk.image
       }
-  Vk.withImageView device imageViewCreateInfo{Vk.image} Nothing (allocate' scope)
+  Vk.withImageView device imageViewCreateInfo Nothing (allocate' scope)
 
 -- | Creates an image view for a texture.
 --
@@ -1468,17 +1525,19 @@ initVulkan enableValidationLayers width height = do
   inst <- createInstance enableValidationLayers
   _dbgMsgsMb <- setupDebugMessenger enableValidationLayers inst
   surface <- createSurface inst window
-  physicalDevice <- liftIO $ pickPhysicalDevice inst
+  physicalDevice <- pickPhysicalDevice inst
+  msaaSamples <- getMaxUsableSampleCount physicalDevice
   (device, queue, queueIndex) <- createLogicalDevice physicalDevice surface
   (swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent) <-
     createSwapchain device physicalDevice surface window
   swapchainImageViews <- createImageViews device swapchainSurfaceFormat swapchainImages
   descriptorSetLayout <- createDescriptorSetLayout device
   (pipelineLayout, graphicsPipeline) <-
-    createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat
+    createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples
   commandPool <- createCommandPool device queueIndex
   (textureImage, mipLevels) <- createTextureImage physicalDevice device commandPool queue
-  (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent
+  (colorImage, colorImageView) <- createColorResources physicalDevice device swapchainExtent swapchainSurfaceFormat msaaSamples
+  (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent msaaSamples
   textureImageView <- createTextureImageView device textureImage mipLevels
   textureSampler <- createTextureSampler device physicalDevice
   (vertices, indices) <- loadModel
@@ -1514,6 +1573,8 @@ initVulkan enableValidationLayers width height = do
     , imageViews = swapchainImageViews
     , depthImage
     , depthImageView
+    , colorImage
+    , colorImageView
     }
   allocations <- view allocatorEnvL
   pure ApplicationEnv{..}
@@ -1547,6 +1608,18 @@ recordCommandBuffer imageIndex frame = do
     Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
     Vk.IMAGE_ASPECT_COLOR_BIT
     frame
+  -- Transition the multisampled color image to COLOR_ATTACHMENT_OPTIMAL
+  transitionImageLayout
+    swapchain.colorImage
+    Vk.IMAGE_LAYOUT_UNDEFINED
+    Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+    Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+    Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+    Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+    Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+    Vk.IMAGE_ASPECT_COLOR_BIT
+    frame
+  -- Transition the depth image to DEPTH_ATTACHMENT_OPTIMAL
   transitionImageLayout
     swapchain.depthImage
     Vk.IMAGE_LAYOUT_UNDEFINED
@@ -1562,8 +1635,11 @@ recordCommandBuffer imageIndex frame = do
     clearColor = Vk.Color $ Vk.Float32 0 0 0 1
     clearDepth = Vk.DepthStencil $ Vk.ClearDepthStencilValue 1 0
     colorAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
-      { Vk.imageView = swapchain.imageViews Vector.! fromIntegral imageIndex
+      { Vk.imageView = swapchain.colorImageView
       , Vk.imageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+      , Vk.resolveMode = Vk.RESOLVE_MODE_AVERAGE_BIT
+      , Vk.resolveImageView = swapchain.imageViews Vector.! fromIntegral imageIndex
+      , Vk.resolveImageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
       , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
       , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
       , Vk.clearValue = clearColor
@@ -1653,7 +1729,7 @@ transitionImageLayout
       , Vk.srcQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
       , Vk.dstQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
       , Vk.image = image
-      , Vk.subresourceRange = zero
+      , Vk.subresourceRange = Vk.ImageSubresourceRange
         { Vk.aspectMask = imageAspectFlags
         , Vk.baseMipLevel = 0
         , Vk.levelCount = 1
@@ -1810,10 +1886,10 @@ recreateSwapchain = do
   Vk.deviceWaitIdle device
 
   cleanupSwapchain
-  (swapchain, surfaceFormat, images, extent) <-
-    createSwapchain device physicalDevice surface window
+  (swapchain, surfaceFormat, images, extent) <- createSwapchain device physicalDevice surface window
   imageViews <- createImageViews device surfaceFormat images
-  (depthImage, depthImageView) <- createDepthResources physicalDevice device extent
+  (colorImage, colorImageView) <- createColorResources physicalDevice device extent surfaceFormat msaaSamples
+  (depthImage, depthImageView) <- createDepthResources physicalDevice device extent msaaSamples
   writeIORef swapchainRef Swapchain{..}
 
 -- | While the window should not close, pools events and renders frames.
