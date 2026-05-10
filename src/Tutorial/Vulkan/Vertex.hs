@@ -6,10 +6,11 @@ module Tutorial.Vulkan.Vertex
   , getAttributeDescriptions
   ) where
 
+import Data.Hashable    (Hashable (..))
 import Data.Kind        (Type)
 import Data.Vector      (Vector)
 import Data.Vector      qualified as Vector
-import Data.Word        (Word16)
+import Data.Word        (Word32)
 import Linear           qualified as Linear
 import UnliftIO.Foreign (Storable (..), castPtr)
 import Vulkan           qualified as Vk
@@ -20,13 +21,18 @@ data Vertex = Vertex
   , color    :: Linear.V3 Float
   , texCoord :: Linear.V2 Float
   }
+  deriving stock (Eq)
+
+instance Hashable Vertex where
+  hashWithSalt salt Vertex{..} =
+    salt `hashWithSalt` pos `hashWithSalt` color `hashWithSalt` texCoord
 
 type Index :: Type
-newtype Index = Index{index :: Word16}
+newtype Index = Index{index :: Word32}
   deriving newtype (Num, Storable)
 
 indexType :: Vk.IndexType
-indexType = Vk.INDEX_TYPE_UINT16
+indexType = Vk.INDEX_TYPE_UINT32
 
 instance Storable Vertex where
   sizeOf _ =

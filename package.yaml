@@ -79,6 +79,7 @@ library:
   - bytestring
   - filepath
   - GLFW-b
+  - hashable
   - JuicyPixels
   - lens
   - linear
@@ -87,8 +88,10 @@ library:
   - resourcet
   - time
   - unliftio
+  - unordered-containers
   - vector
   - vulkan
+  - wavefront
 
 executables:
   khronos-vulkan-tutorial-haskell-exe:

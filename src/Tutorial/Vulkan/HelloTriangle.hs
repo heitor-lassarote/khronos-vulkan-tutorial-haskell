@@ -1,8 +1,9 @@
 module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 
 import Codec.Picture                (Image (..), convertRGBA8, readImage)
+import Codec.Wavefront              qualified as Wavefront
 import Control.Lens                 (Lens', _1, view)
-import Control.Monad                (unless, when)
+import Control.Monad                (foldM, unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
 import Control.Monad.Reader         (MonadReader (..), ReaderT (..))
@@ -13,6 +14,7 @@ import Data.ByteString.Char8        (ByteString)
 import Data.ByteString.Char8        qualified as BS
 import Data.Foldable                (find, for_, traverse_)
 import Data.Functor                 ((<&>))
+import Data.HashMap.Strict          qualified as HashMap
 import Data.Kind                    (Constraint, Type)
 import Data.Maybe                   (fromJust, fromMaybe, isJust)
 import Data.Ord                     (clamp)
@@ -40,7 +42,8 @@ import Vulkan.CStruct.Extends       (SomeStruct (..), pattern (:&))
 import Vulkan.Exception             (VulkanException (..))
 import Vulkan.Zero                  (zero)
 
-import Tutorial.Vulkan.Utils        (findM, iFindIndex, iFindIndexM, perspectiveVulkan)
+import Tutorial.Vulkan.Utils
+  (findM, iFindIndex, iFindIndexM, perspectiveVulkan)
 import Tutorial.Vulkan.Vertex       (Index (..), Vertex (..))
 import Tutorial.Vulkan.Vertex       qualified as Vertex
 
@@ -146,6 +149,8 @@ data ApplicationEnv = ApplicationEnv
   , indexBufferMemory        :: Vk.DeviceMemory
   , startTime                :: UTCTime
   , allocations              :: AllocatorEnv
+  , vertices                 :: SVector.Vector Vertex
+  , indices                  :: SVector.Vector Index
   }
 
 type HasApplicationEnv :: Type -> Constraint
@@ -204,6 +209,12 @@ defaultHeight = 600
 -- | Maximum allowed frames in flight.
 maxFramesInFlight :: Int
 maxFramesInFlight = 2
+
+modelPath :: FilePath
+modelPath = "khronos-vulkan-tutorial-cpp" </> "attachments" </> "assets" </> "viking_room" <.> "obj"
+
+texturePath :: FilePath
+texturePath = "khronos-vulkan-tutorial-cpp" </> "attachments" </> "assets" </> "viking_room" <.> "png"
 
 -- | Allocates memory with @resourcet@'s 'allocate'.
 allocate' :: (MonadScopedAllocator r m) => AllocatorScope -> IO a -> (a -> IO ()) -> m a
@@ -565,36 +576,6 @@ createShaderModule device code = do
     (Vk.createShaderModule device createInfo Nothing)
     (flip (Vk.destroyShaderModule device) Nothing)
 
--- | Describes the vertices of two squares ranging from (-0.5, -0.5, z) to (0.5, 0.5, z), with z in {0, -0.5}.
---
--- The colors (ignored for now) are (top-left, clockwise): red, green, blue, white.
---
--- The texture coordinates (UV) simply go from (0, 0) in the top-left corner to (1, 1) in the bottom-right corner.
---
--- The vertices are linked by 'indices'.
-vertices :: SVector.Vector Vertex
-vertices = SVector.fromList
-  [ Vertex (Linear.V3 -0.5 -0.5  0.0) (Linear.V3 1 0 0) (Linear.V2 1 0)
-  , Vertex (Linear.V3  0.5 -0.5  0.0) (Linear.V3 0 1 0) (Linear.V2 0 0)
-  , Vertex (Linear.V3  0.5  0.5  0.0) (Linear.V3 0 0 1) (Linear.V2 0 1)
-  , Vertex (Linear.V3 -0.5  0.5  0.0) (Linear.V3 1 1 1) (Linear.V2 1 1)
-
-  , Vertex (Linear.V3 -0.5 -0.5 -0.5) (Linear.V3 1 0 0) (Linear.V2 1 0)
-  , Vertex (Linear.V3  0.5 -0.5 -0.5) (Linear.V3 0 1 0) (Linear.V2 0 0)
-  , Vertex (Linear.V3  0.5  0.5 -0.5) (Linear.V3 0 0 1) (Linear.V2 0 1)
-  , Vertex (Linear.V3 -0.5  0.5 -0.5) (Linear.V3 1 1 1) (Linear.V2 1 1)
-  ]
-
--- | Describes the geometry from 'vertices'.
-indices :: SVector.Vector Index
-indices = SVector.fromList
-  [ 0, 1, 2
-  , 2, 3, 0
-
-  , 4, 5, 6
-  , 6, 7, 4
-  ]
-
 -- | Creates the full graphics pipeline, rendering the pipeline layout and pipeline:
 --
 --     * Loads the shader.
@@ -790,7 +771,7 @@ createTextureImage
   :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
   -> m Vk.Image
 createTextureImage physicalDevice device commandPool graphicsQueue =
-  liftIO (readImage ("khronos-vulkan-tutorial-cpp" </> "images" </> "texture" <.> "jpg")) >>= \case
+  liftIO (readImage texturePath) >>= \case
     Left err -> throwIO $ RuntimeError $ "Failed to load texture image: " <> err
     Right (convertRGBA8 -> pixels) -> do
       let imageSize = fromIntegral $ pixels.imageWidth * pixels.imageHeight * 4
@@ -1100,10 +1081,11 @@ createBuffer physicalDevice device size usage properties = do
 -- The staging buffer is released before the function returns.
 createBuffer'
   :: forall bufferElem r m. (MonadScopedAllocator r m, Storable bufferElem)
-  => SVector.Vector bufferElem -> Vk.BufferUsageFlags
+  => Vk.BufferUsageFlags
   -> Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> SVector.Vector bufferElem
   -> m (Vk.Buffer, Vk.DeviceMemory)
-createBuffer' inBuffer bufferTypeBit physicalDevice device commandPool graphicsQueue = do
+createBuffer' bufferTypeBit physicalDevice device commandPool graphicsQueue inBuffer = do
   let bufferSize = sizeOf (undefined :: bufferElem) * SVector.length inBuffer
 
   (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
@@ -1131,17 +1113,72 @@ createBuffer' inBuffer bufferTypeBit physicalDevice device commandPool graphicsQ
 
   pure (buffer, bufferMemory)
 
--- | Creates a vertex buffer for 'vertices'.
-createVertexBuffer
-  :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> m (Vk.Buffer, Vk.DeviceMemory)
-createVertexBuffer = createBuffer' vertices Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
+-- | Loads 'modelPath' from the disk.
+--
+-- See 'triangulate'.
+loadModel :: (MonadIO m) => m (SVector.Vector Vertex, SVector.Vector Index)
+loadModel =
+  Wavefront.fromFile modelPath >>= \case
+    Left err -> throwIO $ RuntimeError err
+    Right obj -> either
+      (throwIO . RuntimeError . ("Failed to triangulate obj: " <>))
+      pure
+      (wavefrontObjToBuffers obj)
 
--- | Creates an index buffer for 'indices'.
-createIndexBuffer
-  :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+-- | Triangulates a Wavefront OBJ file into the vertices and indices vectors expected by Vulkan.
+wavefrontObjToBuffers :: Wavefront.WavefrontOBJ -> Either String (SVector.Vector Vertex, SVector.Vector Index)
+wavefrontObjToBuffers Wavefront.WavefrontOBJ{..} = do
+  (_uniqueVertices, _len, vertices, indices) <- Vector.foldM
+    (\acc Wavefront.Element{elValue = Wavefront.Face fi0 fi1 fi2 fis} -> foldM
+      (\(uniqueVertices, len, vertices, indices) Wavefront.FaceIndex{faceLocIndex = locIx, faceTexCoordIndex} -> do
+        texCoordIx <- maybe
+          (Left $ "No tex coord for loc index: " <> show locIx)
+          Right
+          faceTexCoordIndex
+        vertex <- mkVertex locIx texCoordIx
+        Right $ case HashMap.lookup vertex uniqueVertices of
+          Nothing -> (HashMap.insert vertex len uniqueVertices, len + 1, vertex : vertices, len : indices)
+          Just index -> (uniqueVertices, len, vertices, index : indices))
+      acc
+      (fi0 : fi1 : fi2 : fis))
+    (HashMap.empty, 0, [], [])
+    objFaces
+  pure (SVector.fromList $ reverse vertices, SVector.fromList $ reverse indices)
+ where
+  mkVertex :: Int -> Int -> Either String Vertex
+  mkVertex locIx texCoordIx = do
+    -- OBJ is 1-indexed, so we need to subtract 1 from the indices.
+    Wavefront.Location{..} <- maybe
+      (Left $ "Loc index not present: " <> show locIx)
+      Right
+      (objLocations Vector.!? (locIx - 1))
+    Wavefront.TexCoord{..} <- maybe
+      (Left $ "Tex coord index not present: " <> show texCoordIx)
+      Right
+      (objTexCoords Vector.!? (texCoordIx - 1))
+    -- OBJ assusmes that a vertical coordinate of 0 is the bottom, but 0 means top in Vulkan,
+    -- so we flip it.
+    Right Vertex
+      { pos = Linear.V3 locX locY locZ
+      , color = Linear.V3 1 1 1
+      , texCoord = Linear.V2 texcoordR (1 - texcoordS)
+      }
+
+-- | Creates a vertex buffer for the input.
+createVertexBuffer
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> SVector.Vector Vertex
   -> m (Vk.Buffer, Vk.DeviceMemory)
-createIndexBuffer = createBuffer' indices Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
+createVertexBuffer = createBuffer' Vk.BUFFER_USAGE_VERTEX_BUFFER_BIT
+
+-- | Creates an index buffer for the input.
+createIndexBuffer
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> SVector.Vector Index
+  -> m (Vk.Buffer, Vk.DeviceMemory)
+createIndexBuffer = createBuffer' Vk.BUFFER_USAGE_INDEX_BUFFER_BIT
 
 -- | Creates one host-visible, host-coherent buffer for each in-flight frame.
 --
@@ -1318,10 +1355,11 @@ initVulkan enableValidationLayers width height = do
   (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent
   textureImageView <- createTextureImageView device textureImage
   textureSampler <- createTextureSampler device physicalDevice
+  (vertices, indices) <- loadModel
   (vertexBuffer, vertexBufferMemory) <-
-    createVertexBuffer physicalDevice device commandPool queue
+    createVertexBuffer physicalDevice device commandPool queue vertices
   (indexBuffer, indexBufferMemory) <-
-    createIndexBuffer physicalDevice device commandPool queue
+    createIndexBuffer physicalDevice device commandPool queue indices
   uniformBuffers <- createUniformBuffers physicalDevice device
   descriptorPool <- createDescriptorPool device
   descriptorSets <- do
