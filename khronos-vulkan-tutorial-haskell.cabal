@@ -79,6 +79,7 @@ library
     , bytestring
     , filepath
     , hashable
+    , integer-logarithms
     , lens
     , linear
     , monad-loops

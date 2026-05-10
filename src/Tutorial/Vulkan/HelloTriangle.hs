@@ -20,7 +20,7 @@ import Data.Maybe                   (fromJust, fromMaybe, isJust)
 import Data.Ord                     (clamp)
 import Data.Time                    (UTCTime)
 import Data.Time                    qualified as Time
-import Data.Traversable             (for)
+import Data.Traversable             (for, forAccumM)
 import Data.Vector                  (Vector)
 import Data.Vector                  qualified as Vector
 import Data.Vector.Storable         qualified as SVector
@@ -28,6 +28,7 @@ import Data.Word                    (Word32)
 import Foreign                      (castPtr)
 import Graphics.UI.GLFW             qualified as GLFW
 import Linear                       qualified as Linear
+import Math.NumberTheory.Logarithms (integerLog2)
 import System.FilePath              ((<.>), (</>))
 import System.IO                    (hPutStrLn, stderr)
 import UnliftIO                     (IORef, MonadUnliftIO)
@@ -536,8 +537,9 @@ createImageViews
   -> Vector Vk.Image
   -> m (Vector Vk.ImageView)
 createImageViews device swapchainSurfaceFormat swapchainImages =
+  let mipLevels = 1 in
   for swapchainImages \image ->
-    createImageView device image swapchainSurfaceFormat.format Vk.IMAGE_ASPECT_COLOR_BIT SwapchainAllocatorScope
+    createImageView device image mipLevels swapchainSurfaceFormat.format Vk.IMAGE_ASPECT_COLOR_BIT SwapchainAllocatorScope
 
 -- | Creates a descriptor set layout with two layouts:
 --
@@ -719,17 +721,20 @@ createDepthResources
   -> m (Vk.Image, Vk.ImageView)
 createDepthResources physicalDevice device swapchainExtent = do
   depthFormat <- liftIO $ findDepthFormat physicalDevice
+  let mipLevels = 1
   (depthImage, _depthImageMemory) <- createImage
     physicalDevice
     device
     swapchainExtent.width
     swapchainExtent.height
+    mipLevels
     depthFormat
     Vk.IMAGE_TILING_OPTIMAL
     Vk.IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
     Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
     SwapchainAllocatorScope
-  depthImageView <- createImageView device depthImage depthFormat Vk.IMAGE_ASPECT_DEPTH_BIT SwapchainAllocatorScope
+  depthImageView <-
+    createImageView device depthImage mipLevels depthFormat Vk.IMAGE_ASPECT_DEPTH_BIT SwapchainAllocatorScope
   pure (depthImage, depthImageView)
 
 -- | Finds a format among the candidate formats satisfying the image tiling or throws an error if none are supported.
@@ -761,20 +766,22 @@ findDepthFormat physicalDevice = findSupportedFormat
   Vk.IMAGE_TILING_OPTIMAL
   Vk.FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
 
--- | Loads a texture from the disk (./khronos-vulkan-tutorial-cpp/images/texture.jpg) in RGBA8 format.
+-- | Loads a texture from the disk ('texturePath') in RGBA8 format.
 --
 -- The image is optimized for transfer destination and sampled,
 -- created with 'createImage', using optimal tiling on the local device.
 --
--- Returns the allocated image and image memory.
+-- Returns the allocated image and mip levels.
 createTextureImage
   :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> m Vk.Image
+  -> m (Vk.Image, Word32)
 createTextureImage physicalDevice device commandPool graphicsQueue =
   liftIO (readImage texturePath) >>= \case
     Left err -> throwIO $ RuntimeError $ "Failed to load texture image: " <> err
     Right (convertRGBA8 -> pixels) -> do
-      let imageSize = fromIntegral $ pixels.imageWidth * pixels.imageHeight * 4
+      let
+        imageSize = fromIntegral $ pixels.imageWidth * pixels.imageHeight * 4
+        mipLevels = fromIntegral $ integerLog2 (fromIntegral $ max pixels.imageWidth pixels.imageHeight) + 1
       (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
         physicalDevice
         device
@@ -791,9 +798,10 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
         device
         (fromIntegral pixels.imageWidth)
         (fromIntegral pixels.imageHeight)
+        mipLevels
         Vk.FORMAT_R8G8B8A8_SRGB
         Vk.IMAGE_TILING_OPTIMAL
-        (Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
+        (Vk.IMAGE_USAGE_TRANSFER_SRC_BIT .|. Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
         Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
         GlobalAllocatorScope
 
@@ -802,6 +810,7 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
         commandPool
         graphicsQueue
         textureImage
+        mipLevels
         Vk.IMAGE_LAYOUT_UNDEFINED
         Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
       copyBufferToImage
@@ -812,18 +821,134 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
         textureImage
         (fromIntegral pixels.imageWidth)
         (fromIntegral pixels.imageHeight)
-      transitionImageLayout'
+      -- Transitioned to Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps.
+      generateMipmaps
+        physicalDevice
         device
         commandPool
         graphicsQueue
         textureImage
-        Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-        Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        Vk.FORMAT_R8G8B8A8_SRGB
+        (fromIntegral pixels.imageWidth)
+        (fromIntegral pixels.imageHeight)
+        mipLevels
 
       release stagingBufferMemoryReleaseKey
       release stagingBufferReleaseKey
 
-      pure textureImage
+      pure (textureImage, mipLevels)
+
+-- | Generates mimaps from the provided image.
+--
+-- TODO: Implement resizing in software and load multiple levels from a file.
+generateMipmaps
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
+  -> Vk.Image -> Vk.Format -> Word32 -> Word32 -> Word32
+  -> m ()
+generateMipmaps physicalDevice device commandPool graphicsQueue image imageFormat texWidth texHeight mipLevels = do
+  formatProperties <- Vk.getPhysicalDeviceFormatProperties physicalDevice imageFormat
+  unless (formatProperties.optimalTilingFeatures .&. Vk.FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT /= zeroBits) do
+    throwIO $ RuntimeError "Texture image format does not support linear blitting!"
+
+  let
+    barrier = (zero :: Vk.ImageMemoryBarrier '[])
+      { Vk.srcAccessMask = Vk.ACCESS_TRANSFER_WRITE_BIT
+      , Vk.dstAccessMask = Vk.ACCESS_TRANSFER_READ_BIT
+      , Vk.oldLayout = Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+      , Vk.newLayout = Vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+      , Vk.image
+      , Vk.subresourceRange = Vk.ImageSubresourceRange
+        { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
+        , Vk.baseMipLevel = mipLevels - 1
+        , Vk.levelCount = 1
+        , Vk.baseArrayLayer = 0
+        , Vk.layerCount = 1
+        }
+      , Vk.srcQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
+      , Vk.dstQueueFamilyIndex = Vk.QUEUE_FAMILY_IGNORED
+      }
+
+  withSingleTimeCommands device commandPool graphicsQueue \commandBuffer -> do
+    let s = (fromIntegral texWidth, fromIntegral texHeight)
+    () <$ forAccumM s [1 .. mipLevels - 1] \(mipWidth, mipHeight) i -> do
+      let
+        barrier' = (barrier :: Vk.ImageMemoryBarrier '[])
+          { Vk.subresourceRange = barrier.subresourceRange
+            { Vk.baseMipLevel = i - 1
+            }
+          }
+      Vk.cmdPipelineBarrier
+        commandBuffer
+        Vk.PIPELINE_STAGE_TRANSFER_BIT
+        Vk.PIPELINE_STAGE_TRANSFER_BIT
+        zeroBits
+        Vector.empty
+        Vector.empty
+        (Vector.singleton $ SomeStruct barrier')
+
+      let
+        offsets = (Vk.Offset3D 0 0 0, Vk.Offset3D mipWidth mipHeight 1)
+        dstOffsets =
+          ( Vk.Offset3D 0 0 0
+          , Vk.Offset3D
+            (if mipWidth > 1 then mipWidth `div` 2 else 1)
+            (if mipHeight > 1 then mipHeight `div` 2 else 1)
+            1
+          )
+        blit = Vk.ImageBlit
+          { Vk.srcSubresource = Vk.ImageSubresourceLayers Vk.IMAGE_ASPECT_COLOR_BIT (i - 1) 0 1
+          , Vk.srcOffsets = offsets
+          , Vk.dstSubresource = Vk.ImageSubresourceLayers Vk.IMAGE_ASPECT_COLOR_BIT i 0 1
+          , Vk.dstOffsets = dstOffsets
+          }
+      Vk.cmdBlitImage
+        commandBuffer
+        image
+        Vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+        image
+        Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        (Vector.singleton blit)
+        Vk.FILTER_LINEAR
+
+      let
+        barrier'' = (barrier' :: Vk.ImageMemoryBarrier '[])
+          { Vk.oldLayout = Vk.IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+          , Vk.newLayout = Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+          , Vk.srcAccessMask = Vk.ACCESS_TRANSFER_READ_BIT
+          , Vk.dstAccessMask = Vk.ACCESS_SHADER_READ_BIT
+          }
+      Vk.cmdPipelineBarrier
+        commandBuffer
+        Vk.PIPELINE_STAGE_TRANSFER_BIT
+        Vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+        zeroBits
+        Vector.empty
+        Vector.empty
+        (Vector.singleton $ SomeStruct barrier'')
+
+      pure
+        ( ( if mipWidth > 1 then mipWidth `div` 2 else mipWidth
+          , if mipHeight > 1 then mipHeight `div` 2 else mipHeight
+          )
+        , ()
+        )
+
+    let
+      barrier' = (barrier :: Vk.ImageMemoryBarrier '[])
+        { Vk.oldLayout = Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        , Vk.newLayout = Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        , Vk.srcAccessMask = Vk.ACCESS_TRANSFER_WRITE_BIT
+        , Vk.dstAccessMask = Vk.ACCESS_SHADER_READ_BIT
+        }
+    Vk.cmdPipelineBarrier
+      commandBuffer
+      Vk.PIPELINE_STAGE_TRANSFER_BIT
+      Vk.PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+      zeroBits
+      Vector.empty
+      Vector.empty
+      (Vector.singleton $ SomeStruct barrier')
 
 -- | Creates a 2D image with undefined layout and no multisampling.
 --
@@ -832,18 +957,18 @@ createTextureImage physicalDevice device commandPool graphicsQueue =
 -- The allocator scope indicates where to allocate these objects.
 createImage
   :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device
-  -> Word32 -> Word32
+  -> Word32 -> Word32 -> Word32
   -> Vk.Format -> Vk.ImageTiling -> Vk.ImageUsageFlags -> Vk.MemoryPropertyFlags
   -> AllocatorScope
   -> m (Vk.Image, Vk.DeviceMemory)
-createImage physicalDevice device width height format tiling usage properties scope = do
+createImage physicalDevice device width height mipLevels format tiling usage properties scope = do
   let
     imageInfo = (zero :: Vk.ImageCreateInfo '[])
       { Vk.imageType = Vk.IMAGE_TYPE_2D
       , Vk.format
       , Vk.tiling
       , Vk.extent = Vk.Extent3D width height 1
-      , Vk.mipLevels = 1
+      , Vk.mipLevels
       , Vk.arrayLayers = 1
       , Vk.samples = Vk.SAMPLE_COUNT_1_BIT
       , Vk.usage
@@ -908,8 +1033,8 @@ withSingleTimeCommands device commandPool graphicsQueue action = do
 -- This function is called @transitionImageLayout@ in the C++ tutorial.
 transitionImageLayout'
   :: (MonadScopedAllocator r m) => Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> Vk.Image -> Vk.ImageLayout -> Vk.ImageLayout -> m ()
-transitionImageLayout' device commandPool graphicsQueue image oldLayout newLayout =
+  -> Vk.Image -> Word32 -> Vk.ImageLayout -> Vk.ImageLayout -> m ()
+transitionImageLayout' device commandPool graphicsQueue image mipLevels oldLayout newLayout =
   withSingleTimeCommands device commandPool graphicsQueue \commandBuffer -> do
     (srcAccessMask, dstAccessMask, sourceStage, destinationStage) <-
       case (oldLayout, newLayout) of
@@ -938,7 +1063,7 @@ transitionImageLayout' device commandPool graphicsQueue image oldLayout newLayou
         , Vk.subresourceRange = zero
           { Vk.aspectMask = Vk.IMAGE_ASPECT_COLOR_BIT
           , Vk.baseMipLevel = 0
-          , Vk.levelCount = 1
+          , Vk.levelCount = mipLevels
           , Vk.baseArrayLayer = 0
           , Vk.layerCount = 1
           }
@@ -985,14 +1110,14 @@ copyBufferToImage device commandPool graphicsQueue buffer image width height =
 
 -- | Helper function to create an image view for a given image with a format.
 --
--- The image view each have one mip level and one array layer.
+-- Each image view has one array layer.
 --
 -- The allocator scope indicates where to allocate these objects.
 createImageView
   :: (MonadScopedAllocator r m)
-  => Vk.Device -> Vk.Image -> Vk.Format -> Vk.ImageAspectFlags -> AllocatorScope
+  => Vk.Device -> Vk.Image -> Word32 -> Vk.Format -> Vk.ImageAspectFlags -> AllocatorScope
   -> m Vk.ImageView
-createImageView device image format aspectFlags scope = do
+createImageView device image mipLevels format aspectFlags scope = do
   let
     imageViewCreateInfo = (zero :: Vk.ImageViewCreateInfo '[])
       { Vk.viewType = Vk.IMAGE_VIEW_TYPE_2D
@@ -1000,7 +1125,7 @@ createImageView device image format aspectFlags scope = do
       , Vk.subresourceRange = Vk.ImageSubresourceRange
         { Vk.aspectMask = aspectFlags
         , Vk.baseMipLevel = 0
-        , Vk.levelCount = 1
+        , Vk.levelCount = mipLevels
         , Vk.baseArrayLayer = 0
         , Vk.layerCount = 1
         }
@@ -1010,9 +1135,10 @@ createImageView device image format aspectFlags scope = do
 -- | Creates an image view for a texture.
 --
 -- See 'createImageView'.
-createTextureImageView :: (MonadScopedAllocator r m) => Vk.Device -> Vk.Image -> m Vk.ImageView
-createTextureImageView device textureImage =
-  createImageView device textureImage Vk.FORMAT_R8G8B8A8_SRGB Vk.IMAGE_ASPECT_COLOR_BIT GlobalAllocatorScope
+createTextureImageView
+  :: (MonadScopedAllocator r m) => Vk.Device -> Vk.Image -> Word32 -> m Vk.ImageView
+createTextureImageView device textureImage mipLevels =
+  createImageView device textureImage mipLevels Vk.FORMAT_R8G8B8A8_SRGB Vk.IMAGE_ASPECT_COLOR_BIT GlobalAllocatorScope
 
 -- | Creates a texture sampler with linear filtering and repeat address mode.
 --
@@ -1036,7 +1162,7 @@ createTextureSampler device physicalDevice = do
       , Vk.unnormalizedCoordinates = False
       , Vk.mipLodBias = 0
       , Vk.minLod = 0
-      , Vk.maxLod = 0
+      , Vk.maxLod = Vk.LOD_CLAMP_NONE
       }
   Vk.withSampler device samplerInfo Nothing (allocate' GlobalAllocatorScope)
 
@@ -1351,9 +1477,9 @@ initVulkan enableValidationLayers width height = do
   (pipelineLayout, graphicsPipeline) <-
     createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat
   commandPool <- createCommandPool device queueIndex
-  textureImage <- createTextureImage physicalDevice device commandPool queue
+  (textureImage, mipLevels) <- createTextureImage physicalDevice device commandPool queue
   (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent
-  textureImageView <- createTextureImageView device textureImage
+  textureImageView <- createTextureImageView device textureImage mipLevels
   textureSampler <- createTextureSampler device physicalDevice
   (vertices, indices) <- loadModel
   (vertexBuffer, vertexBufferMemory) <-

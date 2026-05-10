@@ -80,6 +80,7 @@ library:
   - filepath
   - GLFW-b
   - hashable
+  - integer-logarithms
   - JuicyPixels
   - lens
   - linear
