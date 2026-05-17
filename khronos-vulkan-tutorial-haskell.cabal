@@ -33,7 +33,9 @@ custom-setup
 
 library
   exposed-modules:
+      Tutorial.Vulkan.GameObject
       Tutorial.Vulkan.HelloTriangle
+      Tutorial.Vulkan.UniformBufferObject
       Tutorial.Vulkan.Utils
       Tutorial.Vulkan.Vertex
   other-modules:

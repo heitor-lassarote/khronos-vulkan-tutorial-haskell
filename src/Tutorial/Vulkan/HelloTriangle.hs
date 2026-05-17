@@ -1,54 +1,56 @@
 module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 
-import Codec.Ktx2                   qualified as Ktx2
-import Codec.Ktx2.Header            qualified as Ktx2
-import Codec.Ktx2.Read              qualified as Ktx2
-import Control.Lens                 (Lens', _1, view)
-import Control.Monad                (guard, unless, when)
-import Control.Monad.IO.Class       (MonadIO, liftIO)
-import Control.Monad.Loops          (whileM_)
-import Control.Monad.Reader         (MonadReader (..), ReaderT (..))
+import Codec.Ktx2                          qualified as Ktx2
+import Codec.Ktx2.Header                   qualified as Ktx2
+import Codec.Ktx2.Read                     qualified as Ktx2
+import Control.Lens                        (Lens', view, (&), (+~))
+import Control.Monad                       (guard, unless, when)
+import Control.Monad.IO.Class              (MonadIO, liftIO)
+import Control.Monad.Loops                 (whileM_)
+import Control.Monad.Reader                (MonadReader (..), ReaderT (..))
 import Control.Monad.Trans.Resource
   (MonadResource, ReleaseKey, ResIO, allocate, allocate_, release, runResourceT)
-import Data.Bits                    (Bits (..))
-import Data.ByteString.Char8        (ByteString)
-import Data.ByteString.Char8        qualified as BS
-import Data.ByteString.Unsafe       (unsafeUseAsCStringLen)
-import Data.Foldable                (find, for_, traverse_)
-import Data.Functor                 ((<&>))
-import Data.Kind                    (Constraint, Type)
-import Data.Maybe                   (fromJust, fromMaybe, isJust, isNothing)
-import Data.Ord                     (clamp)
-import Data.Time                    (UTCTime)
-import Data.Time                    qualified as Time
-import Data.Traversable             (for, forAccumM)
-import Data.Vector                  (Vector)
-import Data.Vector                  qualified as Vector
-import Data.Vector.Storable         qualified as SVector
-import Data.Word                    (Word32)
-import Foreign                      (castPtr)
-import Graphics.UI.GLFW             qualified as GLFW
-import Linear                       qualified as Linear
-import Math.NumberTheory.Logarithms (integerLog2)
-import System.FilePath              ((<.>), (</>))
-import System.IO                    (hPutStrLn, stderr)
-import Text.GLTF.Loader             qualified as GLTF
-import UnliftIO                     (IORef, MonadUnliftIO)
+import Data.Bits                           (Bits (..))
+import Data.ByteString.Char8               (ByteString)
+import Data.ByteString.Char8               qualified as BS
+import Data.ByteString.Unsafe              (unsafeUseAsCStringLen)
+import Data.Foldable                       (find, for_, traverse_)
+import Data.Functor                        ((<&>))
+import Data.Kind                           (Constraint, Type)
+import Data.Maybe
+  (fromJust, fromMaybe, isJust, isNothing)
+import Data.Ord                            (clamp)
+import Data.Time                           (UTCTime)
+import Data.Time                           qualified as Time
+import Data.Traversable                    (for, forAccumM)
+import Data.Vector                         (Vector)
+import Data.Vector                         qualified as Vector
+import Data.Vector.Storable                qualified as SVector
+import Data.Word                           (Word32)
+import Graphics.UI.GLFW                    qualified as GLFW
+import Linear                              qualified as Linear
+import Math.NumberTheory.Logarithms        (integerLog2)
+import System.FilePath                     ((<.>), (</>))
+import System.IO                           (hPutStrLn, stderr)
+import Text.GLTF.Loader                    qualified as GLTF
+import UnliftIO                            (IORef, MonadUnliftIO)
 import UnliftIO.Exception
   (Exception (displayException), SomeException, assert, catch, finally, throwIO)
 import UnliftIO.Foreign
-  (Ptr, Storable (..), alloca, copyBytes, nullPtr, peekCString)
+  (Ptr, Storable (..), alloca, castPtr, copyBytes, nullPtr, peekCString)
 import UnliftIO.IORef
   (modifyIORef', newIORef, readIORef, writeIORef)
-import Vulkan                       qualified as Vk
-import Vulkan.CStruct.Extends       (SomeStruct (..), pattern (:&))
-import Vulkan.Exception             (VulkanException (..))
-import Vulkan.Zero                  (zero)
+import Vulkan                              qualified as Vk
+import Vulkan.CStruct.Extends              (SomeStruct (..), pattern (:&))
+import Vulkan.Exception                    (VulkanException (..))
+import Vulkan.Zero                         (zero)
 
+import Tutorial.Vulkan.GameObject          (GameObject (..), modelMatrix)
+import Tutorial.Vulkan.UniformBufferObject (UniformBufferObject (..))
 import Tutorial.Vulkan.Utils
   (findM, iFindIndex, iFindIndexM, perspectiveVulkan)
-import Tutorial.Vulkan.Vertex       (Index (..), Vertex (..))
-import Tutorial.Vulkan.Vertex       qualified as Vertex
+import Tutorial.Vulkan.Vertex              (Index (..), Vertex (..))
+import Tutorial.Vulkan.Vertex              qualified as Vertex
 
 foreign import ccall unsafe "debug_callback.c &debug_callback"
   debugCallbackPtr :: Vk.PFN_vkDebugUtilsMessengerCallbackEXT
@@ -58,10 +60,7 @@ data Frame = Frame
   { presentCompleteSemaphore :: Vk.Semaphore
   , inFlightFence            :: Vk.Fence
   , commandBuffer            :: Vk.CommandBuffer
-  , uniformBuffer            :: Vk.Buffer
-  , uniformBufferMemory      :: Vk.DeviceMemory
-  , uniformBufferMapped      :: Ptr UniformBufferObject
-  , descriptorSet            :: Vk.DescriptorSet
+  , frameIndex               :: Word32
   }
 
 type Swapchain :: Type
@@ -78,29 +77,6 @@ data Swapchain = Swapchain
   , framebuffers   :: Vector Vk.Framebuffer
   , renderPassM    :: Maybe Vk.RenderPass
   }
-
-type UniformBufferObject :: Type
-data UniformBufferObject = UniformBufferObject
-  { model, view, proj :: Linear.M44 Float
-  }
-
-instance Storable UniformBufferObject where
-  sizeOf _ = 3 * sizeOf (undefined :: Linear.M44 Float)
-
-  alignment _ = alignment (undefined :: Float)
-
-  peek ptr = do
-    let p = castPtr ptr
-    model <- peek p
-    view' <- peekByteOff p (sizeOf (undefined :: Linear.M44 Float))
-    proj <- peekByteOff p (2 * sizeOf (undefined :: Linear.M44 Float))
-    pure UniformBufferObject{view = view', ..}
-
-  poke ptr UniformBufferObject{view = view', ..} = do
-    let p = castPtr ptr
-    poke p model
-    pokeByteOff p (sizeOf (undefined :: Linear.M44 Float)) view'
-    pokeByteOff p (2 * sizeOf (undefined :: Linear.M44 Float)) proj
 
 type AllocatorScope :: Type
 data AllocatorScope
@@ -160,6 +136,7 @@ data ApplicationEnv = ApplicationEnv
   , vertices                 :: SVector.Vector Vertex
   , indices                  :: SVector.Vector Index
   , msaaSamples              :: Vk.SampleCountFlagBits
+  , gameObjects              :: Vector GameObject
   }
 
 type HasApplicationEnv :: Type -> Constraint
@@ -1437,6 +1414,7 @@ loadModel =
     Left err -> throwIO $ RuntimeError $ show err
     Right model -> pure $ processGltf model.unGltf
 
+-- | Converts a glTF file into the vertices and indices vectors expected by Vulkan.
 processGltf :: GLTF.Gltf -> (SVector.Vector Vertex, SVector.Vector Index)
 processGltf GLTF.Gltf{..} =
   let
@@ -1462,6 +1440,29 @@ processGltf GLTF.Gltf{..} =
   (SVector.fromList $ Vector.toList vertices', SVector.fromList $ Vector.toList indices')
  where
   color = Linear.V3 1 1 1
+
+-- | Creates 3 game objects.
+setupGameObjects
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.DescriptorPool -> Vk.DescriptorSetLayout
+  -> Vk.Sampler -> Vk.ImageView
+  -> m (Vector GameObject)
+setupGameObjects physicalDevice device descriptorPool descriptorSetLayout textureSampler textureImageView =
+  for transforms \(position, rotation, scale) -> do
+    (Vector.unzip3 -> (uniformBuffers, uniformBuffersMemory, uniformBuffersMapped)) <-
+      createUniformBuffers physicalDevice device
+    descriptorSets <-
+      createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers textureSampler textureImageView
+    pure GameObject{..}
+ where
+  transforms = Vector.fromList
+    [ -- Center
+      (Linear.V3 0 0 0, Linear.V3 0 0 0, Linear.V3 1 1 1)
+    , -- Left
+      (Linear.V3 -2 0 -1, Linear.V3 0 (pi / 4) 0, Linear.V3 0.75 0.75 0.75)
+    , -- Right
+      (Linear.V3 2 0 -1, Linear.V3 0 (pi / -4) 0, Linear.V3 0.75 0.75 0.75)
+    ]
 
 -- | Creates a vertex buffer for the input.
 createVertexBuffer
@@ -1501,21 +1502,22 @@ createUniformBuffers physicalDevice device = do
     uniformBufferMapped <- Vk.mapMemory device bufferMemory 0 (fromIntegral bufferSize) zero
     pure (buffer, bufferMemory, castPtr uniformBufferMapped)
 
--- | Creates a pool sized to hold one UBO descriptor per in-flight frame.
-createDescriptorPool :: (MonadScopedAllocator r m) => Vk.Device -> m Vk.DescriptorPool
-createDescriptorPool device = do
+-- | Creates a pool sized to hold 'numObjects' UBO descriptors per in-flight frame.
+createDescriptorPool
+  :: (MonadScopedAllocator r m) => Vk.Device -> Word32 -> m Vk.DescriptorPool
+createDescriptorPool device numObjects = do
   let
     uboPoolSize = Vk.DescriptorPoolSize
       { Vk.type' = Vk.DESCRIPTOR_TYPE_UNIFORM_BUFFER
-      , Vk.descriptorCount = fromIntegral maxFramesInFlight
+      , Vk.descriptorCount = fromIntegral maxFramesInFlight * numObjects
       }
     combinedImageSamplerPoolSize = Vk.DescriptorPoolSize
       { Vk.type' = Vk.DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
-      , Vk.descriptorCount = fromIntegral maxFramesInFlight
+      , Vk.descriptorCount = fromIntegral maxFramesInFlight * numObjects
       }
     poolInfo = (zero :: Vk.DescriptorPoolCreateInfo '[])
       { Vk.flags = Vk.DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT
-      , Vk.maxSets = fromIntegral maxFramesInFlight
+      , Vk.maxSets = fromIntegral maxFramesInFlight * numObjects
       , Vk.poolSizes = Vector.fromList
         [ uboPoolSize
         , combinedImageSamplerPoolSize
@@ -1661,30 +1663,26 @@ initVulkan width height = do
   textureImageView <- createTextureImageView device textureImage format mipLevels
   textureSampler <- createTextureSampler device physicalDevice
   (vertices, indices) <- loadModel
+  descriptorPool <- createDescriptorPool device 3
+  gameObjects <-
+    setupGameObjects physicalDevice device descriptorPool descriptorSetLayout textureSampler textureImageView
   (vertexBuffer, vertexBufferMemory) <-
     createVertexBuffer physicalDevice device commandPool queue vertices
   (indexBuffer, indexBufferMemory) <-
     createIndexBuffer physicalDevice device commandPool queue indices
-  uniformBuffers <- createUniformBuffers physicalDevice device
-  descriptorPool <- createDescriptorPool device
-  descriptorSets <- do
-    let uniformBuffers' = fmap (view _1) uniformBuffers
-    createDescriptorSets device descriptorPool descriptorSetLayout uniformBuffers' textureSampler textureImageView
   commandBuffers <- createCommandBuffers device commandPool
   (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences) <-
     createSyncObjects device swapchainImages
   let
-    frames = Vector.zipWith5
+    frames = Vector.zipWith4
       (\presentCompleteSemaphore
         inFlightFence
         commandBuffer
-        (uniformBuffer, uniformBufferMemory, uniformBufferMapped)
-        descriptorSet -> Frame{..})
+        frameIndex -> Frame{..})
       presentCompleteSemaphores
       inFlightFences
       commandBuffers
-      uniformBuffers
-      descriptorSets
+      (Vector.generate maxFramesInFlight fromIntegral)
   swapchainRef <- newIORef Swapchain
     { swapchain
     , surfaceFormat = swapchainSurfaceFormat
@@ -1709,7 +1707,7 @@ initVulkan width height = do
 --     * Binds the pipeline.
 --     * Sets dynamic viewport/scissor.
 --     * Binds vertex/input buffers and the descriptor set.
---     * Draws.
+--     * Draws each game object.
 --     * Ends rendering.
 --     * Transitions the image to present layout.
 recordCommandBuffer :: (MonadApplication r m) => Word32 -> Frame -> m ()
@@ -1804,14 +1802,16 @@ recordCommandBuffer imageIndex frame = do
   Vk.cmdSetScissor frame.commandBuffer 0 (Vector.singleton (Vk.Rect2D (Vk.Offset2D 0 0) swapchain.extent))
   Vk.cmdBindVertexBuffers frame.commandBuffer 0 (Vector.singleton vertexBuffer) (Vector.singleton 0)
   Vk.cmdBindIndexBuffer frame.commandBuffer indexBuffer 0 Vertex.indexType
-  Vk.cmdBindDescriptorSets
-    frame.commandBuffer
-    Vk.PIPELINE_BIND_POINT_GRAPHICS
-    pipelineLayout
-    0
-    (Vector.singleton frame.descriptorSet)
-    Vector.empty
-  Vk.cmdDrawIndexed frame.commandBuffer (fromIntegral $ SVector.length indices) 1 0 0 0
+
+  for_ gameObjects \GameObject{descriptorSets} -> do
+    Vk.cmdBindDescriptorSets
+      frame.commandBuffer
+      Vk.PIPELINE_BIND_POINT_GRAPHICS
+      pipelineLayout
+      0
+      (Vector.singleton (descriptorSets Vector.! fromIntegral frame.frameIndex))
+      Vector.empty
+    Vk.cmdDrawIndexed frame.commandBuffer (fromIntegral $ SVector.length indices) 1 0 0 0
 
   case swapchain.renderPassM of
     Nothing -> do
@@ -1921,7 +1921,7 @@ drawFrame frameIndex = do
   continue drawFences imageIndex frame swapchain = do
     ApplicationEnv{..} <- view applicationEnvL
 
-    updateUniformBuffer frame
+    updateUniformBuffers frame
 
     -- Only reset the fence if we are submitting work
     Vk.resetFences device drawFences
@@ -1963,35 +1963,36 @@ drawFrame frameIndex = do
 
     pure True
 
--- | Computes the MVP matrices and writes the result into the frame's 'uniformBufferMapped'.
+-- | Computes the MVP matrices for each game object and writes the result into the object's 'uniformBufferMapped'.
 --
--- The model is rotated around the Z axis at 90 degrees per second.
+-- The models are rotated around the Y axis at 0.1 radians per second.
 --
--- The camera is located at (2, 2, 2), and looks towards the origin.
+-- The camera is located at (2, 2, 6), and looks towards the origin.
 --
 -- The FOV is set at 45 degrees and y-flipped for Vulkan.
-updateUniformBuffer :: (MonadApplication r m) => Frame -> m ()
-updateUniformBuffer frame = do
-  ApplicationEnv{startTime, swapchainRef} <- view applicationEnvL
+updateUniformBuffers :: (MonadApplication r m) => Frame -> m ()
+updateUniformBuffers frame = do
+  ApplicationEnv{startTime, swapchainRef, gameObjects} <- view applicationEnvL
   currentTime <- liftIO Time.getCurrentTime
   swapchain <- readIORef swapchainRef
   let
     time = realToFrac $ Time.diffUTCTime currentTime startTime
     -- Need to transpose the matrices to column-major.
     initialRotation =
-      Linear.m33_to_m44 $ Linear.fromQuaternion $ Linear.axisAngle (Linear.V3 1 0 0) (pi / 2)
-    continuousRotation = Linear.mkTransformation
-      (Linear.axisAngle (Linear.V3 0 0 1) (time * pi / 2))
-      (Linear.V3 0 0 0)
-    model = Linear.transpose $ continuousRotation Linear.!*! initialRotation
-    view' = Linear.transpose $ Linear.lookAt (Linear.V3 2 2 2) (Linear.V3 0 0 0) (Linear.V3 0 0 1)
+      Linear.transpose $ Linear.m33_to_m44 $ Linear.fromQuaternion $ Linear.axisAngle (Linear.V3 1 0 0) (pi / 2)
+    view' = Linear.transpose $ Linear.lookAt (Linear.V3 2 2 6) (Linear.V3 0 0 0) (Linear.V3 0 0 1)
     proj = Linear.transpose $ perspectiveVulkan
       (pi / 4)
       (realToFrac swapchain.extent.width / realToFrac swapchain.extent.height)
       0.1
-      10
-    ubo = UniformBufferObject{view = view', ..}
-  liftIO $ poke frame.uniformBufferMapped ubo
+      20
+  for_ gameObjects \gameObject -> do
+    let
+      rotationY = gameObject.rotation & Linear._y +~ 0.1 * time
+      continuousRotation = modelMatrix gameObject{rotation = rotationY}
+      model = continuousRotation Linear.!*! initialRotation
+      ubo = UniformBufferObject{view = view', ..}
+    liftIO $ poke (gameObject.uniformBuffersMapped Vector.! fromIntegral frame.frameIndex) ubo
 
 -- | Checks whether a Vulkan exception was thrown indicating an out of date result.
 --
