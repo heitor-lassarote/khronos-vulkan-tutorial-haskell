@@ -65,6 +65,7 @@ library
       ScopedTypeVariables
       StandaloneKindSignatures
       StrictData
+      TupleSections
       TypeApplications
       TypeData
       TypeFamilies
@@ -124,6 +125,7 @@ executable khronos-vulkan-tutorial-haskell-exe
       ScopedTypeVariables
       StandaloneKindSignatures
       StrictData
+      TupleSections
       TypeApplications
       TypeData
       TypeFamilies
@@ -166,6 +168,7 @@ test-suite khronos-vulkan-tutorial-haskell-test
       ScopedTypeVariables
       StandaloneKindSignatures
       StrictData
+      TupleSections
       TypeApplications
       TypeData
       TypeFamilies

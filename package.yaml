@@ -53,6 +53,7 @@ default-extensions:
 - ScopedTypeVariables
 - StandaloneKindSignatures
 - StrictData
+- TupleSections
 - TypeApplications
 - TypeData
 - TypeFamilies

@@ -3,7 +3,7 @@ module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 import Codec.Picture                (Image (..), convertRGBA8, readImage)
 import Codec.Wavefront              qualified as Wavefront
 import Control.Lens                 (Lens', _1, view)
-import Control.Monad                (foldM, unless, when)
+import Control.Monad                (foldM, guard, unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
 import Control.Monad.Reader         (MonadReader (..), ReaderT (..))
@@ -16,7 +16,7 @@ import Data.Foldable                (find, for_, traverse_)
 import Data.Functor                 ((<&>))
 import Data.HashMap.Strict          qualified as HashMap
 import Data.Kind                    (Constraint, Type)
-import Data.Maybe                   (fromJust, fromMaybe, isJust)
+import Data.Maybe                   (fromJust, fromMaybe, isJust, isNothing)
 import Data.Ord                     (clamp)
 import Data.Time                    (UTCTime)
 import Data.Time                    qualified as Time
@@ -73,6 +73,8 @@ data Swapchain = Swapchain
   , depthImageView :: Vk.ImageView
   , colorImage     :: Vk.Image
   , colorImageView :: Vk.ImageView
+  , framebuffers   :: Vector Vk.Framebuffer
+  , renderPassM    :: Maybe Vk.RenderPass
   }
 
 type UniformBufferObject :: Type
@@ -120,6 +122,7 @@ type MonadScopedAllocator r m =
   ( HasAllocatorEnv r
   , MonadReader r m
   , MonadResource m
+  , MonadUnliftIO m
   )
 
 type ScopedAllocator :: Type -> Type
@@ -255,8 +258,8 @@ makeVersion :: Word32 -> Word32 -> Word32 -> Word32
 makeVersion major minor patch = major `shift` 22 .|. minor `shift` 12 .|. patch
 
 -- | Enumerates the required Vulkan extensions from GLFW and optionally the validation layer.
-getRequiredInstanceExtensions :: (MonadIO m) => Bool -> m (Vector ByteString)
-getRequiredInstanceExtensions enableValidationLayers = do
+getRequiredInstanceExtensions :: (MonadIO m) => m (Vector ByteString)
+getRequiredInstanceExtensions = do
   glfwExtensions <-
     traverse (fmap BS.pack . peekCString) . Vector.fromList =<< liftIO GLFW.getRequiredInstanceExtensions
   extensionProperties <-
@@ -267,23 +270,19 @@ getRequiredInstanceExtensions enableValidationLayers = do
     unless (any ((== glfwExtension) . Vk.extensionName) extensionProperties) do
       throwIO $ RuntimeError $ "Unsupported GLFW extension: " <> BS.unpack glfwExtension
 
-  pure $ (if enableValidationLayers then Vector.cons Vk.EXT_DEBUG_UTILS_EXTENSION_NAME else id) glfwExtensions
+  let
+    debugUtilsAvailable =
+      elem Vk.EXT_DEBUG_UTILS_EXTENSION_NAME $ fmap (.extensionName) extensionProperties
+
+  pure $ (if debugUtilsAvailable then Vector.cons Vk.EXT_DEBUG_UTILS_EXTENSION_NAME else id) glfwExtensions
 
 -- | Creates a Vulkan instance, optionally enabling the validation layer.
-createInstance :: (MonadScopedAllocator r m) => Bool -> m Vk.Instance
-createInstance enableValidationLayers = do
-  when enableValidationLayers do
-    layerNames <-
-      withResultCheck "Error enumerating instance layer properties" $
-        (fmap . fmap . fmap) (.layerName) Vk.enumerateInstanceLayerProperties
-    case find (`notElem` layerNames) requiredLayers of
-      Nothing -> pure ()
-      Just layerName -> throwIO $ RuntimeError $ "Unsupported required layer: " <> BS.unpack layerName
-
-  glfwExtensions <- getRequiredInstanceExtensions enableValidationLayers
+createInstance :: (MonadScopedAllocator r m) => m Vk.Instance
+createInstance = do
+  glfwExtensions <- getRequiredInstanceExtensions
 
   let
-    appInfo = zero
+    createInfo = (zero :: Vk.InstanceCreateInfo '[])
       { Vk.applicationInfo = Just Vk.ApplicationInfo
         { Vk.applicationName = Just "Hello Triangle"
         , Vk.applicationVersion = makeVersion 1 0 0
@@ -292,19 +291,14 @@ createInstance enableValidationLayers = do
         , Vk.apiVersion = Vk.API_VERSION_1_3
         }
       , Vk.enabledExtensionNames = glfwExtensions
-      , Vk.enabledLayerNames = requiredLayers
       }
 
-  Vk.withInstance appInfo Nothing (allocate' GlobalAllocatorScope)
- where
-  requiredLayers
-    | enableValidationLayers = Vector.singleton "VK_LAYER_KHRONOS_validation"
-    | otherwise              = Vector.empty
+  Vk.withInstance createInfo Nothing (allocate' GlobalAllocatorScope)
 
 -- | Optionally registers a debug messenger. See 'debugCallbackPtr'.
-setupDebugMessenger :: (MonadScopedAllocator r m) => Bool -> Vk.Instance -> m (Maybe Vk.DebugUtilsMessengerEXT)
-setupDebugMessenger enableValidationLayers inst =
-  if enableValidationLayers then do
+setupDebugMessenger :: (MonadScopedAllocator r m) => Vk.Instance -> m (Maybe Vk.DebugUtilsMessengerEXT)
+setupDebugMessenger inst = catch
+  do
     let
       createInfo = zero
         { Vk.messageSeverity = severityFlags
@@ -312,11 +306,11 @@ setupDebugMessenger enableValidationLayers inst =
         , Vk.pfnUserCallback = debugCallbackPtr
         }
     Just <$> Vk.withDebugUtilsMessengerEXT inst createInfo Nothing (allocate' GlobalAllocatorScope)
-  else
-    pure Nothing
+  (\(_ :: IOError) -> pure Nothing)
  where
   severityFlags =
-    Vk.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
+    Vk.DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT
+    .|. Vk.DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
     .|. Vk.DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT
 
   messageTypeFlags =
@@ -354,14 +348,16 @@ getMaxUsableSampleCount physicalDevice = do
 --     7. Dynamic rendering.
 --     8. @synchronization2@.
 --     9. Extended dynamic state.
-pickPhysicalDevice :: (MonadIO m) => Vk.Instance -> m Vk.PhysicalDevice
+--
+-- Additionally returns whether dynamic rendering is supported ('True' if supported).
+pickPhysicalDevice :: (MonadIO m) => Vk.Instance -> m (Vk.PhysicalDevice, Bool)
 pickPhysicalDevice inst = do
   physicalDevices <-
     withResultCheck "Error enumerating physical devices" $
       Vk.enumeratePhysicalDevices inst
   when (Vector.null physicalDevices) do
     throwIO $ RuntimeError "Failed to find GPUs with Vulkan support"
-  devices <- flip Vector.filterM physicalDevices \physicalDevice -> do
+  devices <- flip Vector.mapMaybeM physicalDevices \physicalDevice -> do
     properties <- Vk.getPhysicalDeviceProperties physicalDevice
     supportedFeatures <- Vk.getPhysicalDeviceFeatures physicalDevice
     features <- Vk.getPhysicalDeviceFeatures2
@@ -390,25 +386,38 @@ pickPhysicalDevice inst = do
         :& physicalDeviceVulkan13Features
         :& physicalDeviceExtendedDynamicStateFeatures
         :& ()) = features.next
+      -- TODO: Make synchronization2 support optional. I'm too lazy to do it now.
+      --
+      -- According to vulkan.gpuinfo.org, this is supported by 77.26% of the devices as of now (2026-05-16),
+      -- so I think it's fine.
+      --
+      -- In contrast, dynamic rendering is supported by 67.06%.
       supportsRequiredFeatures =
         supportedFeatures.samplerAnisotropy
         && supportedFeatures.sampleRateShading
         && physicalDeviceVulkan11Features.shaderDrawParameters
-        && physicalDeviceVulkan13Features.dynamicRendering
         && physicalDeviceVulkan13Features.synchronization2
         && physicalDeviceExtendedDynamicStateFeatures.extendedDynamicState
+      supportsDynamicRendering =
+        physicalDeviceVulkan13Features.dynamicRendering
+        || elem Vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME ((.extensionName) <$> availableDeviceExtensions)
 
-    pure $ supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures
+    pure do
+      guard (supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures)
+      pure (physicalDevice, supportsDynamicRendering)
 
   when (Vector.null devices) do
     throwIO $ RuntimeError "failed to find a suitable GPU!"
-  Vector.headM devices
+  let deviceWithDynamicRenderingSupport = Vector.find snd devices
+  maybe (Vector.headM devices) pure deviceWithDynamicRenderingSupport
 
 -- | Creates a logical device that supports all capabilities from 'pickPhysicalDevice'.
 --
 -- This function also retrieves the graphics+present queue and its index.
-createLogicalDevice :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.SurfaceKHR -> m (Vk.Device, Vk.Queue, Word32)
-createLogicalDevice physicalDevice surface = do
+createLogicalDevice
+  :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.SurfaceKHR -> Bool
+  -> m (Vk.Device, Vk.Queue, Word32)
+createLogicalDevice physicalDevice surface dynamicRendering = do
   queueFamilyProperties <- Vk.getPhysicalDeviceQueueFamilyProperties physicalDevice
 
   -- Find queue family property that supports both graphics and present
@@ -442,7 +451,7 @@ createLogicalDevice physicalDevice surface = do
         { Vk.shaderDrawParameters = True
         }
       :& (zero :: Vk.PhysicalDeviceVulkan13Features)
-        { Vk.dynamicRendering = True
+        { Vk.dynamicRendering
         , Vk.synchronization2 = True
         }
       :& (zero :: Vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT){Vk.extendedDynamicState = True}
@@ -550,6 +559,105 @@ createSwapchain device physicalDevice surface window = do
       Vk.getSwapchainImagesKHR device swapchain
   pure (swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent)
 
+-- | Creates a render pass, if dynamic rendering is unsupported.
+createRenderPass
+  :: (MonadScopedAllocator r m)
+  => Vk.PhysicalDevice -> Vk.Device -> Vk.Format -> Vk.SampleCountFlagBits -> Bool
+  -> m (Maybe Vk.RenderPass)
+createRenderPass physicalDevice device swapchainImageFormat msaaSamples dynamicRenderingSupported
+  | dynamicRenderingSupported = pure Nothing
+  | otherwise = do
+    depthFormat <- findDepthFormat physicalDevice
+    let
+      colorAttachment = Vk.AttachmentDescription
+        { Vk.format = swapchainImageFormat
+        , Vk.samples = msaaSamples
+        , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
+        , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
+        , Vk.stencilLoadOp = Vk.ATTACHMENT_LOAD_OP_DONT_CARE
+        , Vk.stencilStoreOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
+        , Vk.initialLayout = Vk.IMAGE_LAYOUT_UNDEFINED
+        , Vk.finalLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        , Vk.flags = zeroBits
+        }
+      depthAttachment = Vk.AttachmentDescription
+        { Vk.format = depthFormat
+        , Vk.samples = msaaSamples
+        , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
+        , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
+        , Vk.stencilLoadOp = Vk.ATTACHMENT_LOAD_OP_DONT_CARE
+        , Vk.stencilStoreOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
+        , Vk.initialLayout = Vk.IMAGE_LAYOUT_UNDEFINED
+        , Vk.finalLayout = Vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        , Vk.flags = zeroBits
+        }
+      colorAttachmentResolve = Vk.AttachmentDescription
+        { Vk.format = swapchainImageFormat
+        , Vk.samples = Vk.SAMPLE_COUNT_1_BIT
+        , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_DONT_CARE
+        , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
+        , Vk.stencilLoadOp = Vk.ATTACHMENT_LOAD_OP_DONT_CARE
+        , Vk.stencilStoreOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
+        , Vk.initialLayout = Vk.IMAGE_LAYOUT_UNDEFINED
+        , Vk.finalLayout = Vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
+        , Vk.flags = zeroBits
+        }
+      -- Subpass reference to the color and depth attachments
+      colorAttachmentRef = Vk.AttachmentReference
+        { Vk.attachment = 0
+        , Vk.layout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        }
+      depthAttachmentRef = Vk.AttachmentReference
+        { Vk.attachment = 1
+        , Vk.layout = Vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        }
+      colorAttachmentResolveRef = Vk.AttachmentReference
+        { Vk.attachment = 2
+        , Vk.layout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        }
+      subpass = (zero :: Vk.SubpassDescription)
+        { Vk.pipelineBindPoint = Vk.PIPELINE_BIND_POINT_GRAPHICS
+        , Vk.colorAttachments = Vector.singleton colorAttachmentRef
+        , Vk.resolveAttachments = Vector.singleton colorAttachmentResolveRef
+        , Vk.depthStencilAttachment = Just depthAttachmentRef
+        }
+      -- Dependency to ensure proper image layout transitions
+      dependency = Vk.SubpassDependency
+        { Vk.srcSubpass = Vk.SUBPASS_EXTERNAL
+        , Vk.dstSubpass = zero
+        , Vk.srcStageMask = Vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT .|. Vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+        , Vk.dstStageMask = Vk.PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT .|. Vk.PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+        , Vk.srcAccessMask = Vk.ACCESS_NONE
+        , Vk.dstAccessMask = Vk.ACCESS_COLOR_ATTACHMENT_WRITE_BIT .|. Vk.ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+        , Vk.dependencyFlags = zeroBits
+        }
+      renderPassInfo = (zero :: Vk.RenderPassCreateInfo '[])
+        { Vk.attachments = Vector.fromList [colorAttachment, depthAttachment, colorAttachmentResolve]
+        , Vk.subpasses = Vector.singleton subpass
+        , Vk.dependencies = Vector.singleton dependency
+        }
+    Just <$> Vk.withRenderPass device renderPassInfo Nothing (allocate' SwapchainAllocatorScope)
+
+-- | If the render pass is provided, creates a swapchain framebuffer.
+--
+-- Returns an empty vector otherwise.
+createFramebuffers
+  :: (MonadScopedAllocator r m)
+  => Vk.Device -> Vk.ImageView -> Vk.ImageView -> Vector Vk.ImageView
+  -> Vk.Extent2D -> Maybe Vk.RenderPass -> m (Vector Vk.Framebuffer)
+createFramebuffers device colorImageView depthImageView swapchainImageViews swapchainExtent = \case
+  Nothing -> pure Vector.empty
+  Just renderPass -> for swapchainImageViews \imageView -> do
+    let
+      framebufferInfo = (zero :: Vk.FramebufferCreateInfo '[])
+        { Vk.renderPass
+        , Vk.attachments = Vector.fromList [colorImageView, depthImageView, imageView]
+        , Vk.width = swapchainExtent.width
+        , Vk.height = swapchainExtent.height
+        , Vk.layers = 1
+        }
+    Vk.withFramebuffer device framebufferInfo Nothing (allocate' SwapchainAllocatorScope)
+
 -- | Creates the views into the images obtained by 'createSwapchain'.
 --
 -- The images are allocated in the swapchain scope to be released.
@@ -618,9 +726,9 @@ createShaderModule device code = do
 createGraphicsPipeline
   :: (MonadScopedAllocator r m)
   => Vk.PhysicalDevice -> Vk.Device -> Vk.DescriptorSetLayout -> Vk.SurfaceFormatKHR
-  -> Vk.SampleCountFlagBits
+  -> Vk.SampleCountFlagBits -> Maybe Vk.RenderPass
   -> m (Vk.PipelineLayout, Vk.Pipeline)
-createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples = do
+createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples renderPassM = do
   shaderCode <- liftIO $ BS.readFile ("shaders" </> "triangle" <.> "spv")
   (shaderModuleKey, shaderModule) <- createShaderModule device shaderCode
   let
@@ -698,32 +806,47 @@ createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfac
 
   depthFormat <- findDepthFormat physicalDevice
   let
-    pipelineCreateInfoChain = (zero :: Vk.GraphicsPipelineCreateInfo '[])
-      { Vk.stageCount = 2
-      , Vk.stages = SomeStruct <$> shaderStages
-      , Vk.vertexInputState = Just $ SomeStruct vertexInputInfo
-      , Vk.inputAssemblyState = Just inputAssemblyState
-      , Vk.viewportState = Just $ SomeStruct viewportState
-      , Vk.rasterizationState = Just $ SomeStruct rasterizer
-      , Vk.multisampleState = Just $ SomeStruct multisampling
-      , Vk.colorBlendState = Just $ SomeStruct colorBlending
-      , Vk.dynamicState = Just dynamicState
-      , Vk.layout = pipelineLayout
-      , Vk.renderPass = Vk.NULL_HANDLE
-      , Vk.depthStencilState = Just depthStencil
-      , Vk.next = (zero :: Vk.PipelineRenderingCreateInfo)
-        { Vk.colorAttachmentFormats = Vector.singleton swapchainSurfaceFormat.format
-        , Vk.depthAttachmentFormat = depthFormat
+    pipelineCreateInfoChain = case renderPassM of
+      Nothing -> SomeStruct (zero :: Vk.GraphicsPipelineCreateInfo '[])
+        { Vk.stageCount = 2
+        , Vk.stages = SomeStruct <$> shaderStages
+        , Vk.vertexInputState = Just $ SomeStruct vertexInputInfo
+        , Vk.inputAssemblyState = Just inputAssemblyState
+        , Vk.viewportState = Just $ SomeStruct viewportState
+        , Vk.rasterizationState = Just $ SomeStruct rasterizer
+        , Vk.multisampleState = Just $ SomeStruct multisampling
+        , Vk.colorBlendState = Just $ SomeStruct colorBlending
+        , Vk.dynamicState = Just dynamicState
+        , Vk.layout = pipelineLayout
+        , Vk.depthStencilState = Just depthStencil
+        , Vk.next = (zero :: Vk.PipelineRenderingCreateInfo)
+          { Vk.colorAttachmentFormats = Vector.singleton swapchainSurfaceFormat.format
+          , Vk.depthAttachmentFormat = depthFormat
+          }
+          :& ()
         }
-        :& ()
-      }
+      Just renderPass -> SomeStruct (zero :: Vk.GraphicsPipelineCreateInfo '[])
+        { Vk.stageCount = 2
+        , Vk.stages = SomeStruct <$> shaderStages
+        , Vk.vertexInputState = Just $ SomeStruct vertexInputInfo
+        , Vk.inputAssemblyState = Just inputAssemblyState
+        , Vk.viewportState = Just $ SomeStruct viewportState
+        , Vk.rasterizationState = Just $ SomeStruct rasterizer
+        , Vk.multisampleState = Just $ SomeStruct multisampling
+        , Vk.colorBlendState = Just $ SomeStruct colorBlending
+        , Vk.dynamicState = Just dynamicState
+        , Vk.layout = pipelineLayout
+        , Vk.renderPass
+        , Vk.subpass = 0
+        , Vk.depthStencilState = Just depthStencil
+        }
 
   graphicsPipelines <-
     withResultCheck "Failed to create graphics pipeline" $
       Vk.withGraphicsPipelines
         device
         zero
-        (Vector.singleton $ SomeStruct pipelineCreateInfoChain)
+        (Vector.singleton pipelineCreateInfoChain)
         Nothing
         (allocate' GlobalAllocatorScope)
   let graphicsPipeline = assert (Vector.length graphicsPipelines == 1) (Vector.head graphicsPipelines)
@@ -1517,27 +1640,31 @@ createSyncObjects device swapchainImages = do
   pure (presentCompleteSemaphores, renderFinishedSemaphores, inFlightFences)
 
 -- | Initializes GLFW, Vulkan, and creates all necessary objects for 'Application'.
-initVulkan :: (MonadScopedAllocator r m) => Bool -> Int -> Int -> m ApplicationEnv
-initVulkan enableValidationLayers width height = do
+initVulkan :: (MonadScopedAllocator r m) => Int -> Int -> m ApplicationEnv
+initVulkan width height = do
   startTime <- liftIO Time.getCurrentTime
   framebufferResizedRef <- newIORef False
   window <- initWindow width height framebufferResizedRef
-  inst <- createInstance enableValidationLayers
-  _dbgMsgsMb <- setupDebugMessenger enableValidationLayers inst
+  inst <- createInstance
+  _dbgMsgsMb <- setupDebugMessenger inst
   surface <- createSurface inst window
-  physicalDevice <- pickPhysicalDevice inst
+  (physicalDevice, dynamicRenderingSupported) <- pickPhysicalDevice inst
   msaaSamples <- getMaxUsableSampleCount physicalDevice
-  (device, queue, queueIndex) <- createLogicalDevice physicalDevice surface
+  (device, queue, queueIndex) <- createLogicalDevice physicalDevice surface dynamicRenderingSupported
   (swapchain, swapchainSurfaceFormat, swapchainImages, swapchainExtent) <-
     createSwapchain device physicalDevice surface window
   swapchainImageViews <- createImageViews device swapchainSurfaceFormat swapchainImages
+  renderPassM <- createRenderPass physicalDevice device swapchainSurfaceFormat.format msaaSamples dynamicRenderingSupported
   descriptorSetLayout <- createDescriptorSetLayout device
   (pipelineLayout, graphicsPipeline) <-
-    createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples
+    createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples renderPassM
   commandPool <- createCommandPool device queueIndex
   (textureImage, mipLevels) <- createTextureImage physicalDevice device commandPool queue
-  (colorImage, colorImageView) <- createColorResources physicalDevice device swapchainExtent swapchainSurfaceFormat msaaSamples
+  (colorImage, colorImageView) <-
+    createColorResources physicalDevice device swapchainExtent swapchainSurfaceFormat msaaSamples
   (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent msaaSamples
+  framebuffers <-
+    createFramebuffers device colorImageView depthImageView swapchainImageViews swapchainExtent renderPassM
   textureImageView <- createTextureImageView device textureImage mipLevels
   textureSampler <- createTextureSampler device physicalDevice
   (vertices, indices) <- loadModel
@@ -1575,6 +1702,8 @@ initVulkan enableValidationLayers width height = do
     , depthImageView
     , colorImage
     , colorImageView
+    , framebuffers
+    , renderPassM
     }
   allocations <- view allocatorEnvL
   pure ApplicationEnv{..}
@@ -1623,7 +1752,7 @@ recordCommandBuffer imageIndex frame = do
   transitionImageLayout
     swapchain.depthImage
     Vk.IMAGE_LAYOUT_UNDEFINED
-    Vk.IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
+    Vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     Vk.ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
     Vk.ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
     (Vk.PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT .|. Vk.PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT)
@@ -1634,31 +1763,44 @@ recordCommandBuffer imageIndex frame = do
   let
     clearColor = Vk.Color $ Vk.Float32 0 0 0 1
     clearDepth = Vk.DepthStencil $ Vk.ClearDepthStencilValue 1 0
-    colorAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
-      { Vk.imageView = swapchain.colorImageView
-      , Vk.imageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-      , Vk.resolveMode = Vk.RESOLVE_MODE_AVERAGE_BIT
-      , Vk.resolveImageView = swapchain.imageViews Vector.! fromIntegral imageIndex
-      , Vk.resolveImageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-      , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
-      , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
-      , Vk.clearValue = clearColor
-      }
-    depthAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
-      { Vk.imageView = swapchain.depthImageView
-      , Vk.imageLayout = Vk.IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL
-      , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
-      , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
-      , Vk.clearValue = clearDepth
-      }
-    renderingInfo = (zero :: Vk.RenderingInfo '[])
-      { Vk.renderArea = zero{Vk.offset = Vk.Offset2D 0 0, Vk.extent = swapchain.extent}
-      , Vk.layerCount = 1
-      , Vk.colorAttachments = Vector.singleton colorAttachmentInfo
-      , Vk.depthAttachment = Just depthAttachmentInfo
-      }
+    renderArea = Vk.Rect2D {Vk.offset = Vk.Offset2D 0 0, Vk.extent = swapchain.extent}
 
-  Vk.cmdBeginRendering frame.commandBuffer renderingInfo
+  case swapchain.renderPassM of
+    Nothing -> do
+      let
+        colorAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
+          { Vk.imageView = swapchain.colorImageView
+          , Vk.imageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+          , Vk.resolveMode = Vk.RESOLVE_MODE_AVERAGE_BIT
+          , Vk.resolveImageView = swapchain.imageViews Vector.! fromIntegral imageIndex
+          , Vk.resolveImageLayout = Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+          , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
+          , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_STORE
+          , Vk.clearValue = clearColor
+          }
+        depthAttachmentInfo = (zero :: Vk.RenderingAttachmentInfo)
+          { Vk.imageView = swapchain.depthImageView
+          , Vk.imageLayout = Vk.IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+          , Vk.loadOp = Vk.ATTACHMENT_LOAD_OP_CLEAR
+          , Vk.storeOp = Vk.ATTACHMENT_STORE_OP_DONT_CARE
+          , Vk.clearValue = clearDepth
+          }
+        renderingInfo = (zero :: Vk.RenderingInfo '[])
+          { Vk.renderArea
+          , Vk.layerCount = 1
+          , Vk.colorAttachments = Vector.singleton colorAttachmentInfo
+          , Vk.depthAttachment = Just depthAttachmentInfo
+          }
+      Vk.cmdBeginRendering frame.commandBuffer renderingInfo
+    Just renderPass -> do
+      let
+        renderPassInfo = (zero :: Vk.RenderPassBeginInfo '[])
+          { Vk.renderPass
+          , Vk.framebuffer = swapchain.framebuffers Vector.! fromIntegral imageIndex
+          , Vk.renderArea
+          , Vk.clearValues = Vector.fromList [clearColor, clearDepth]
+          }
+      Vk.cmdBeginRenderPass frame.commandBuffer renderPassInfo Vk.SUBPASS_CONTENTS_INLINE
 
   Vk.cmdBindPipeline frame.commandBuffer Vk.PIPELINE_BIND_POINT_GRAPHICS graphicsPipeline
   Vk.cmdSetViewport
@@ -1678,18 +1820,22 @@ recordCommandBuffer imageIndex frame = do
     Vector.empty
   Vk.cmdDrawIndexed frame.commandBuffer (fromIntegral $ SVector.length indices) 1 0 0 0
 
-  Vk.cmdEndRendering frame.commandBuffer
+  case swapchain.renderPassM of
+    Nothing -> do
+      Vk.cmdEndRendering frame.commandBuffer
 
-  transitionImageLayout
-    image
-    Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-    Vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
-    Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
-    zero
-    Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
-    Vk.PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT
-    Vk.IMAGE_ASPECT_COLOR_BIT
-    frame
+      -- Transition swapchain image to present layout
+      transitionImageLayout
+        image
+        Vk.IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+        Vk.IMAGE_LAYOUT_PRESENT_SRC_KHR
+        Vk.ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+        zero
+        Vk.PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+        Vk.PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT
+        Vk.IMAGE_ASPECT_COLOR_BIT
+        frame
+    Just _renderPass -> Vk.cmdEndRenderPass frame.commandBuffer
 
   Vk.endCommandBuffer frame.commandBuffer
 
@@ -1877,6 +2023,7 @@ cleanupSwapchain = do
 recreateSwapchain :: (MonadApplication r m) => m ()
 recreateSwapchain = do
   ApplicationEnv{..} <- view applicationEnvL
+  oldSwapchain <- readIORef swapchainRef
 
   -- Pause while minimized
   liftIO $ whileM_
@@ -1888,8 +2035,10 @@ recreateSwapchain = do
   cleanupSwapchain
   (swapchain, surfaceFormat, images, extent) <- createSwapchain device physicalDevice surface window
   imageViews <- createImageViews device surfaceFormat images
+  renderPassM <- createRenderPass physicalDevice device surfaceFormat.format msaaSamples (isNothing oldSwapchain.renderPassM)
   (colorImage, colorImageView) <- createColorResources physicalDevice device extent surfaceFormat msaaSamples
   (depthImage, depthImageView) <- createDepthResources physicalDevice device extent msaaSamples
+  framebuffers <- createFramebuffers device colorImageView depthImageView imageViews extent renderPassM
   writeIORef swapchainRef Swapchain{..}
 
 -- | While the window should not close, pools events and renders frames.
@@ -1910,10 +2059,8 @@ defaultMain = catch
   (runResourceT $ do
     swapchainAllocationsRef <- newIORef []
     applicationEnv <- flip runReaderT AllocatorEnv{..} $ (.runScopedAllocator) @(ScopedAllocator _) $
-      initVulkan enableValidationLayers defaultWidth defaultHeight
+      initVulkan defaultWidth defaultHeight
     flip runReaderT applicationEnv $ (.runApplication) @(Application _) do
       mainLoop `finally` Vk.deviceWaitIdle applicationEnv.device)
   \(err :: SomeException) ->
     hPutStrLn stderr $ displayException err
- where
-  enableValidationLayers = True

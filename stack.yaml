@@ -42,8 +42,8 @@ packages:
 #
 extra-deps:
 - vulkan-3.26.4@sha256:60723619151ed887af07017c712bf9923e5475796b07e1aee8e9c909f4a3aa1a,34156
-- git: https://github.com/heitor-lassarote/wavefront
-  commit: 18f55340aed9c1fef76d1274183e89a56a9d8821
+- git: https://git.sr.ht/~heitor/wavefront
+  commit: 7c157af011c646cd9c8286d126aa967ad1a670e5
 
 # Override default flag values for project packages and extra-deps
 # flags: {}
