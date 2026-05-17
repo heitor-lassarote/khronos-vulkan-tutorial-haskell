@@ -41,9 +41,14 @@ packages:
 #   commit: e7b331f14bcffb8367cd58fbfc8b40ec7642100a
 #
 extra-deps:
+- git: https://gitlab.com/dpwiz/ktx.git
+  subdir: ktx-codec
+  commit: 6e9408ce2347f70a7c952ffcdbda3dc6d1fba60b
+- git: https://gitlab.com/heitor.toledo/gltf.git
+  subdir: gltf-codec
+  commit: eacd7eb5de83600c4f3886e2f3207a1eff4e3780
+- gltf-loader-0.3.0.0@sha256:e1ebcadd308fa53fadfa284ad8e374cba96d44ed0939f52708534f8ae4feb6f7,5837
 - vulkan-3.26.4@sha256:60723619151ed887af07017c712bf9923e5475796b07e1aee8e9c909f4a3aa1a,34156
-- git: https://git.sr.ht/~heitor/wavefront
-  commit: 7c157af011c646cd9c8286d126aa967ad1a670e5
 
 # Override default flag values for project packages and extra-deps
 # flags: {}

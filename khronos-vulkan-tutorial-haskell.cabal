@@ -75,12 +75,13 @@ library
       cbits/debug_callback.c
   build-depends:
       GLFW-b
-    , JuicyPixels
     , base >=4.7 && <5
     , bytestring
     , filepath
+    , gltf-loader
     , hashable
     , integer-logarithms
+    , ktx-codec
     , lens
     , linear
     , monad-loops
@@ -88,10 +89,8 @@ library
     , resourcet
     , time
     , unliftio
-    , unordered-containers
     , vector
     , vulkan
-    , wavefront
   default-language: Haskell2010
 
 executable khronos-vulkan-tutorial-haskell-exe

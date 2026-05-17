@@ -5,23 +5,45 @@
 
 packages:
 - completed:
+    commit: 6e9408ce2347f70a7c952ffcdbda3dc6d1fba60b
+    git: https://gitlab.com/dpwiz/ktx.git
+    name: ktx-codec
+    pantry-tree:
+      sha256: 2d461dd8bf4bac8d1d4662d6bb3bfd7fce6a72c6e7cc75c41131f81eddfbe285
+      size: 889
+    subdir: ktx-codec
+    version: 0.1.0.0
+  original:
+    commit: 6e9408ce2347f70a7c952ffcdbda3dc6d1fba60b
+    git: https://gitlab.com/dpwiz/ktx.git
+    subdir: ktx-codec
+- completed:
+    commit: eacd7eb5de83600c4f3886e2f3207a1eff4e3780
+    git: https://gitlab.com/heitor.toledo/gltf.git
+    name: gltf-codec
+    pantry-tree:
+      sha256: 0225f24cc6884f6baae28103d674419d537dda634b9c2794fc14e95ff57df312
+      size: 1672
+    subdir: gltf-codec
+    version: 0.1.0.5
+  original:
+    commit: eacd7eb5de83600c4f3886e2f3207a1eff4e3780
+    git: https://gitlab.com/heitor.toledo/gltf.git
+    subdir: gltf-codec
+- completed:
+    hackage: gltf-loader-0.3.0.0@sha256:e1ebcadd308fa53fadfa284ad8e374cba96d44ed0939f52708534f8ae4feb6f7,5837
+    pantry-tree:
+      sha256: 556fefe2e71c1c8d4927ec467ad86f7308f8e8b377f43ed4c328ab5f2de37daf
+      size: 1863
+  original:
+    hackage: gltf-loader-0.3.0.0@sha256:e1ebcadd308fa53fadfa284ad8e374cba96d44ed0939f52708534f8ae4feb6f7,5837
+- completed:
     hackage: vulkan-3.26.4@sha256:60723619151ed887af07017c712bf9923e5475796b07e1aee8e9c909f4a3aa1a,34156
     pantry-tree:
       sha256: d88124b804534526aeb8da55d77d7161e751408815407ed9e3c16db1a5bb134c
       size: 94192
   original:
     hackage: vulkan-3.26.4@sha256:60723619151ed887af07017c712bf9923e5475796b07e1aee8e9c909f4a3aa1a,34156
-- completed:
-    commit: 7c157af011c646cd9c8286d126aa967ad1a670e5
-    git: https://git.sr.ht/~heitor/wavefront
-    name: wavefront
-    pantry-tree:
-      sha256: cbd233525bf5e5ce43464fce1ec43496afff937c5836d4d11e3d70daa4c6988e
-      size: 1124
-    version: 0.7.1.5
-  original:
-    commit: 7c157af011c646cd9c8286d126aa967ad1a670e5
-    git: https://git.sr.ht/~heitor/wavefront
 snapshots:
 - completed:
     sha256: 655e468f774beee1badf07dc4c45fb50288d5c66ce7bef6f487b7f92891a90b0

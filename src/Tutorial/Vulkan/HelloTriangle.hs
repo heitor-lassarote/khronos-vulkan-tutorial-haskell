@@ -1,9 +1,10 @@
 module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 
-import Codec.Picture                (Image (..), convertRGBA8, readImage)
-import Codec.Wavefront              qualified as Wavefront
+import Codec.Ktx2                   qualified as Ktx2
+import Codec.Ktx2.Header            qualified as Ktx2
+import Codec.Ktx2.Read              qualified as Ktx2
 import Control.Lens                 (Lens', _1, view)
-import Control.Monad                (foldM, guard, unless, when)
+import Control.Monad                (guard, unless, when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
 import Control.Monad.Reader         (MonadReader (..), ReaderT (..))
@@ -12,9 +13,9 @@ import Control.Monad.Trans.Resource
 import Data.Bits                    (Bits (..))
 import Data.ByteString.Char8        (ByteString)
 import Data.ByteString.Char8        qualified as BS
+import Data.ByteString.Unsafe       (unsafeUseAsCStringLen)
 import Data.Foldable                (find, for_, traverse_)
 import Data.Functor                 ((<&>))
-import Data.HashMap.Strict          qualified as HashMap
 import Data.Kind                    (Constraint, Type)
 import Data.Maybe                   (fromJust, fromMaybe, isJust, isNothing)
 import Data.Ord                     (clamp)
@@ -31,6 +32,7 @@ import Linear                       qualified as Linear
 import Math.NumberTheory.Logarithms (integerLog2)
 import System.FilePath              ((<.>), (</>))
 import System.IO                    (hPutStrLn, stderr)
+import Text.GLTF.Loader             qualified as GLTF
 import UnliftIO                     (IORef, MonadUnliftIO)
 import UnliftIO.Exception
   (Exception (displayException), SomeException, assert, catch, finally, throwIO)
@@ -218,10 +220,10 @@ maxFramesInFlight :: Int
 maxFramesInFlight = 2
 
 modelPath :: FilePath
-modelPath = "khronos-vulkan-tutorial-cpp" </> "attachments" </> "assets" </> "viking_room" <.> "obj"
+modelPath = "khronos-vulkan-tutorial-cpp" </> "attachments" </> "assets" </> "viking_room" <.> "glb"
 
 texturePath :: FilePath
-texturePath = "khronos-vulkan-tutorial-cpp" </> "attachments" </> "assets" </> "viking_room" <.> "png"
+texturePath = "khronos-vulkan-tutorial-cpp" </> "attachments" </> "assets" </> "viking_room" <.> "ktx2"
 
 -- | Allocates memory with @resourcet@'s 'allocate'.
 allocate' :: (MonadScopedAllocator r m) => AllocatorScope -> IO a -> (a -> IO ()) -> m a
@@ -944,78 +946,84 @@ findDepthFormat physicalDevice = findSupportedFormat
   Vk.IMAGE_TILING_OPTIMAL
   Vk.FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
 
--- | Loads a texture from the disk ('texturePath') in RGBA8 format.
+-- | Loads a texture from the disk ('texturePath').
 --
 -- The image is optimized for transfer destination and sampled,
 -- created with 'createImage', using optimal tiling on the local device.
 --
--- Returns the allocated image and mip levels.
+-- Returns the allocated image, its format, and mip levels.
 createTextureImage
   :: (MonadScopedAllocator r m) => Vk.PhysicalDevice -> Vk.Device -> Vk.CommandPool -> Vk.Queue
-  -> m (Vk.Image, Word32)
-createTextureImage physicalDevice device commandPool graphicsQueue =
-  liftIO (readImage texturePath) >>= \case
-    Left err -> throwIO $ RuntimeError $ "Failed to load texture image: " <> err
-    Right (convertRGBA8 -> pixels) -> do
-      let
-        imageSize = fromIntegral $ pixels.imageWidth * pixels.imageHeight * 4
-        mipLevels = fromIntegral $ integerLog2 (fromIntegral $ max pixels.imageWidth pixels.imageHeight) + 1
-      (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
-        physicalDevice
-        device
-        imageSize
-        Vk.BUFFER_USAGE_TRANSFER_SRC_BIT
-        (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
-      data' <- Vk.mapMemory device stagingBufferMemory 0 imageSize zero
-      liftIO $ SVector.unsafeWith pixels.imageData \ptr ->
-        copyBytes (castPtr data') ptr (fromIntegral imageSize)
-      Vk.unmapMemory device stagingBufferMemory
+  -> m (Vk.Image, Vk.Format, Word32)
+createTextureImage physicalDevice device commandPool graphicsQueue = do
+  ktx2 <- Ktx2.fromFile texturePath
+  level <- case ktx2.levels of
+    (_, lvl) : _ -> pure lvl
+    _            -> throwIO $ RuntimeError "Texture has no levels"
+  let
+    width = ktx2.header.pixelWidth
+    height = ktx2.header.pixelHeight
+    imageSize = fromIntegral $ BS.length level
+    -- TODO: Proper handling of mip levels.
+    -- We currently regenerate mip maps, but the texture may have its own.
+    mipLevels = fromIntegral $ integerLog2 (fromIntegral $ max width height) + 1
+    format = Vk.Format $ fromIntegral $ ktx2.header.vkFormat
+  (stagingBufferReleaseKey, stagingBufferMemoryReleaseKey, stagingBuffer, stagingBufferMemory) <- createBuffer
+    physicalDevice
+    device
+    imageSize
+    Vk.BUFFER_USAGE_TRANSFER_SRC_BIT
+    (Vk.MEMORY_PROPERTY_HOST_VISIBLE_BIT .|. Vk.MEMORY_PROPERTY_HOST_COHERENT_BIT)
+  liftIO $ unsafeUseAsCStringLen level \(ptr, len) -> do
+    data' <- Vk.mapMemory device stagingBufferMemory 0 imageSize zero
+    copyBytes (castPtr data') ptr len
+    Vk.unmapMemory device stagingBufferMemory
 
-      (textureImage, _imageMemory) <- createImage
-        physicalDevice
-        device
-        (fromIntegral pixels.imageWidth)
-        (fromIntegral pixels.imageHeight)
-        mipLevels
-        Vk.FORMAT_R8G8B8A8_SRGB
-        Vk.IMAGE_TILING_OPTIMAL
-        (Vk.IMAGE_USAGE_TRANSFER_SRC_BIT .|. Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
-        Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        Vk.SAMPLE_COUNT_1_BIT
-        GlobalAllocatorScope
+  (textureImage, _imageMemory) <- createImage
+    physicalDevice
+    device
+    width
+    height
+    mipLevels
+    format
+    Vk.IMAGE_TILING_OPTIMAL
+    (Vk.IMAGE_USAGE_TRANSFER_SRC_BIT .|. Vk.IMAGE_USAGE_TRANSFER_DST_BIT .|. Vk.IMAGE_USAGE_SAMPLED_BIT)
+    Vk.MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    Vk.SAMPLE_COUNT_1_BIT
+    GlobalAllocatorScope
 
-      transitionImageLayout'
-        device
-        commandPool
-        graphicsQueue
-        textureImage
-        mipLevels
-        Vk.IMAGE_LAYOUT_UNDEFINED
-        Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-      copyBufferToImage
-        device
-        commandPool
-        graphicsQueue
-        stagingBuffer
-        textureImage
-        (fromIntegral pixels.imageWidth)
-        (fromIntegral pixels.imageHeight)
-      -- Transitioned to Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps.
-      generateMipmaps
-        physicalDevice
-        device
-        commandPool
-        graphicsQueue
-        textureImage
-        Vk.FORMAT_R8G8B8A8_SRGB
-        (fromIntegral pixels.imageWidth)
-        (fromIntegral pixels.imageHeight)
-        mipLevels
+  transitionImageLayout'
+    device
+    commandPool
+    graphicsQueue
+    textureImage
+    mipLevels
+    Vk.IMAGE_LAYOUT_UNDEFINED
+    Vk.IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+  copyBufferToImage
+    device
+    commandPool
+    graphicsQueue
+    stagingBuffer
+    textureImage
+    width
+    height
+  -- Transitioned to Vk.IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps.
+  generateMipmaps
+    physicalDevice
+    device
+    commandPool
+    graphicsQueue
+    textureImage
+    format
+    width
+    height
+    mipLevels
 
-      release stagingBufferMemoryReleaseKey
-      release stagingBufferReleaseKey
+  release stagingBufferMemoryReleaseKey
+  release stagingBufferReleaseKey
 
-      pure (textureImage, mipLevels)
+  pure (textureImage, format, mipLevels)
 
 -- | Generates mimaps from the provided image.
 --
@@ -1316,9 +1324,10 @@ createImageView device image mipLevels format aspectFlags scope = do
 --
 -- See 'createImageView'.
 createTextureImageView
-  :: (MonadScopedAllocator r m) => Vk.Device -> Vk.Image -> Word32 -> m Vk.ImageView
-createTextureImageView device textureImage mipLevels =
-  createImageView device textureImage mipLevels Vk.FORMAT_R8G8B8A8_SRGB Vk.IMAGE_ASPECT_COLOR_BIT GlobalAllocatorScope
+  :: (MonadScopedAllocator r m) => Vk.Device -> Vk.Image -> Vk.Format -> Word32
+  -> m Vk.ImageView
+createTextureImageView device textureImage format mipLevels =
+  createImageView device textureImage mipLevels format Vk.IMAGE_ASPECT_COLOR_BIT GlobalAllocatorScope
 
 -- | Creates a texture sampler with linear filtering and repeat address mode.
 --
@@ -1421,54 +1430,38 @@ createBuffer' bufferTypeBit physicalDevice device commandPool graphicsQueue inBu
 
 -- | Loads 'modelPath' from the disk.
 --
--- See 'triangulate'.
-loadModel :: (MonadIO m) => m (SVector.Vector Vertex, SVector.Vector Index)
+-- See 'processGltf'.
+loadModel :: (MonadUnliftIO m) => m (SVector.Vector Vertex, SVector.Vector Index)
 loadModel =
-  Wavefront.fromFile modelPath >>= \case
-    Left err -> throwIO $ RuntimeError err
-    Right obj -> either
-      (throwIO . RuntimeError . ("Failed to triangulate obj: " <>))
-      pure
-      (wavefrontObjToBuffers obj)
+  GLTF.fromBinaryFile modelPath >>= \case
+    Left err -> throwIO $ RuntimeError $ show err
+    Right model -> pure $ processGltf model.unGltf
 
--- | Triangulates a Wavefront OBJ file into the vertices and indices vectors expected by Vulkan.
-wavefrontObjToBuffers :: Wavefront.WavefrontOBJ -> Either String (SVector.Vector Vertex, SVector.Vector Index)
-wavefrontObjToBuffers Wavefront.WavefrontOBJ{..} = do
-  (_uniqueVertices, _len, vertices, indices) <- Vector.foldM
-    (\acc Wavefront.Element{elValue = Wavefront.Face fi0 fi1 fi2 fis} -> foldM
-      (\(uniqueVertices, len, vertices, indices) Wavefront.FaceIndex{faceLocIndex = locIx, faceTexCoordIndex} -> do
-        texCoordIx <- maybe
-          (Left $ "No tex coord for loc index: " <> show locIx)
-          Right
-          faceTexCoordIndex
-        vertex <- mkVertex locIx texCoordIx
-        Right $ case HashMap.lookup vertex uniqueVertices of
-          Nothing -> (HashMap.insert vertex len uniqueVertices, len + 1, vertex : vertices, len : indices)
-          Just index -> (uniqueVertices, len, vertices, index : indices))
-      acc
-      (fi0 : fi1 : fi2 : fis))
-    (HashMap.empty, 0, [], [])
-    objFaces
-  pure (SVector.fromList $ reverse vertices, SVector.fromList $ reverse indices)
+processGltf :: GLTF.Gltf -> (SVector.Vector Vertex, SVector.Vector Index)
+processGltf GLTF.Gltf{..} =
+  let
+    (vertices', indices') = Vector.foldl'
+      (\acc GLTF.Mesh{..} -> Vector.foldl'
+        (\(vs, is) GLTF.MeshPrimitive{..} ->
+          let
+            baseVertex = fromIntegral $ Vector.length vs
+            -- glTF uses a right-handed coordinate system with Y-up, while Vulkan has Y-down.
+            vertices = Vector.map
+              (\(pos, texCoord) -> Vertex{pos, color, texCoord})
+              (Vector.zip meshPrimitivePositions meshPrimitiveTexCoords)
+            indices = Vector.map
+              (\index -> fromIntegral index + baseVertex)
+              meshPrimitiveIndices
+          in
+          (vs <> vertices, is <> indices))
+        acc
+        meshPrimitives)
+      (Vector.empty, Vector.empty)
+      gltfMeshes
+  in
+  (SVector.fromList $ Vector.toList vertices', SVector.fromList $ Vector.toList indices')
  where
-  mkVertex :: Int -> Int -> Either String Vertex
-  mkVertex locIx texCoordIx = do
-    -- OBJ is 1-indexed, so we need to subtract 1 from the indices.
-    Wavefront.Location{..} <- maybe
-      (Left $ "Loc index not present: " <> show locIx)
-      Right
-      (objLocations Vector.!? (locIx - 1))
-    Wavefront.TexCoord{..} <- maybe
-      (Left $ "Tex coord index not present: " <> show texCoordIx)
-      Right
-      (objTexCoords Vector.!? (texCoordIx - 1))
-    -- OBJ assusmes that a vertical coordinate of 0 is the bottom, but 0 means top in Vulkan,
-    -- so we flip it.
-    Right Vertex
-      { pos = Linear.V3 locX locY locZ
-      , color = Linear.V3 1 1 1
-      , texCoord = Linear.V2 texcoordR (1 - texcoordS)
-      }
+  color = Linear.V3 1 1 1
 
 -- | Creates a vertex buffer for the input.
 createVertexBuffer
@@ -1659,13 +1652,13 @@ initVulkan width height = do
   (pipelineLayout, graphicsPipeline) <-
     createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfaceFormat msaaSamples renderPassM
   commandPool <- createCommandPool device queueIndex
-  (textureImage, mipLevels) <- createTextureImage physicalDevice device commandPool queue
+  (textureImage, format, mipLevels) <- createTextureImage physicalDevice device commandPool queue
   (colorImage, colorImageView) <-
     createColorResources physicalDevice device swapchainExtent swapchainSurfaceFormat msaaSamples
   (depthImage, depthImageView) <- createDepthResources physicalDevice device swapchainExtent msaaSamples
   framebuffers <-
     createFramebuffers device colorImageView depthImageView swapchainImageViews swapchainExtent renderPassM
-  textureImageView <- createTextureImageView device textureImage mipLevels
+  textureImageView <- createTextureImageView device textureImage format mipLevels
   textureSampler <- createTextureSampler device physicalDevice
   (vertices, indices) <- loadModel
   (vertexBuffer, vertexBufferMemory) <-
@@ -1985,9 +1978,12 @@ updateUniformBuffer frame = do
   let
     time = realToFrac $ Time.diffUTCTime currentTime startTime
     -- Need to transpose the matrices to column-major.
-    model = Linear.transpose $ Linear.mkTransformation
+    initialRotation =
+      Linear.m33_to_m44 $ Linear.fromQuaternion $ Linear.axisAngle (Linear.V3 1 0 0) (pi / 2)
+    continuousRotation = Linear.mkTransformation
       (Linear.axisAngle (Linear.V3 0 0 1) (time * pi / 2))
       (Linear.V3 0 0 0)
+    model = Linear.transpose $ continuousRotation Linear.!*! initialRotation
     view' = Linear.transpose $ Linear.lookAt (Linear.V3 2 2 2) (Linear.V3 0 0 0) (Linear.V3 0 0 1)
     proj = Linear.transpose $ perspectiveVulkan
       (pi / 4)
