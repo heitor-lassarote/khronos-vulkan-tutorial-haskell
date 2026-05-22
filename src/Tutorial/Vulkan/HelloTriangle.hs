@@ -844,7 +844,7 @@ createCommandPool device queueIndex = do
       }
   Vk.withCommandPool device poolInfo Nothing (allocate' GlobalAllocatorScope)
 
--- | Creates a depth image for use with the color buffer (for multisampling) as well as its image view.
+-- | Creates a color image for use with the color buffer (for multisampling) as well as its image view.
 createColorResources
   :: (MonadScopedAllocator r m)
   => Vk.PhysicalDevice -> Vk.Device -> Vk.Extent2D -> Vk.SurfaceFormatKHR
@@ -1347,9 +1347,7 @@ createBuffer physicalDevice device size usage properties = do
       , Vk.usage
       , Vk.sharingMode = Vk.SHARING_MODE_EXCLUSIVE
       }
-  (bufferReleaseKey, buffer) <- allocate
-    (Vk.createBuffer device bufferInfo Nothing)
-    (flip (Vk.destroyBuffer device) Nothing)
+  (bufferReleaseKey, buffer) <- Vk.withBuffer device bufferInfo Nothing allocate
 
   memRequirements <- Vk.getBufferMemoryRequirements device buffer
   memTypeIndex <- findMemoryType physicalDevice memRequirements.memoryTypeBits properties
@@ -1358,9 +1356,7 @@ createBuffer physicalDevice device size usage properties = do
       { Vk.allocationSize = memRequirements.size
       , Vk.memoryTypeIndex = memTypeIndex
       }
-  (bufferMemoryReleaseKey, bufferMemory) <- allocate
-    (Vk.allocateMemory device memoryAllocateInfo Nothing)
-    (flip (Vk.freeMemory device) Nothing)
+  (bufferMemoryReleaseKey, bufferMemory) <- Vk.withMemory device memoryAllocateInfo Nothing allocate
 
   Vk.bindBufferMemory device buffer bufferMemory 0
 
@@ -2046,11 +2042,11 @@ mainLoop = do
   whileM_ (liftIO $ not <$> GLFW.windowShouldClose window) do
     frameIndex <- readIORef frameIndexRef
     liftIO GLFW.pollEvents
-    skippedFrame <- drawFrame frameIndex
-    unless skippedFrame do
+    shouldIncrementFrameCounter <- drawFrame frameIndex
+    when shouldIncrementFrameCounter do
       writeIORef frameIndexRef $ (frameIndex + 1) `mod` maxFramesInFlight
 
--- | Creates a window and renders the contents from the Vulkan triangle (now a square) tutorial.
+-- | Creates a window and renders the contents from the Vulkan tutorial.
 defaultMain :: IO ()
 defaultMain = catch
   (runResourceT $ do

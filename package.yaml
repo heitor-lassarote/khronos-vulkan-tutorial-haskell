@@ -88,6 +88,7 @@ library:
   - linear
   - monad-loops
   - mtl
+  - random
   - resourcet
   - time
   - unliftio

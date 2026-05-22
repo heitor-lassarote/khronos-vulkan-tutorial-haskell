@@ -35,6 +35,7 @@ library
   exposed-modules:
       Tutorial.Vulkan.GameObject
       Tutorial.Vulkan.HelloTriangle
+      Tutorial.Vulkan.Particles
       Tutorial.Vulkan.UniformBufferObject
       Tutorial.Vulkan.Utils
       Tutorial.Vulkan.Vertex
@@ -88,6 +89,7 @@ library
     , linear
     , monad-loops
     , mtl
+    , random
     , resourcet
     , time
     , unliftio

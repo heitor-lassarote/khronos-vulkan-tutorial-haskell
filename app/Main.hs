@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Tutorial.Vulkan.HelloTriangle (defaultMain)
+import Tutorial.Vulkan.Particles (defaultMain)
 
 main :: IO ()
 main = defaultMain
