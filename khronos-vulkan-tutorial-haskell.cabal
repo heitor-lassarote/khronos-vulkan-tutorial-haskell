@@ -33,6 +33,7 @@ custom-setup
 
 library
   exposed-modules:
+      Tutorial.Vulkan.Common
       Tutorial.Vulkan.GameObject
       Tutorial.Vulkan.HelloTriangle
       Tutorial.Vulkan.Particles
@@ -53,6 +54,7 @@ library
       DerivingStrategies
       DuplicateRecordFields
       FlexibleContexts
+      FlexibleInstances
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
@@ -97,14 +99,14 @@ library
     , vulkan
   default-language: Haskell2010
 
-executable khronos-vulkan-tutorial-haskell-exe
+executable hello-triangle-exe
   main-is: Main.hs
   other-modules:
       Paths_khronos_vulkan_tutorial_haskell
   autogen-modules:
       Paths_khronos_vulkan_tutorial_haskell
   hs-source-dirs:
-      app
+      app/HelloTriangle
   default-extensions:
       BlockArguments
       ConstraintKinds
@@ -113,6 +115,50 @@ executable khronos-vulkan-tutorial-haskell-exe
       DerivingStrategies
       DuplicateRecordFields
       FlexibleContexts
+      FlexibleInstances
+      GeneralizedNewtypeDeriving
+      ImportQualifiedPost
+      LambdaCase
+      LexicalNegation
+      MultiParamTypeClasses
+      MultiWayIf
+      NamedFieldPuns
+      NoFieldSelectors
+      OverloadedRecordDot
+      OverloadedStrings
+      PatternSynonyms
+      RecordWildCards
+      ScopedTypeVariables
+      StandaloneKindSignatures
+      StrictData
+      TupleSections
+      TypeApplications
+      TypeData
+      TypeFamilies
+      ViewPatterns
+  ghc-options: -Werror -Weverything -Wno-all-missed-specialisations -Wno-ambiguous-fields -Wno-implicit-prelude -Wno-missed-specialisations -Wno-missing-import-lists -Wno-missing-role-annotations -Wno-missing-safe-haskell-mode -Wno-monomorphism-restriction -Wno-unsafe -threaded -rtsopts -with-rtsopts=-N
+  build-depends:
+      base >=4.7 && <5
+    , khronos-vulkan-tutorial-haskell
+  default-language: Haskell2010
+
+executable particles-exe
+  main-is: Main.hs
+  other-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  autogen-modules:
+      Paths_khronos_vulkan_tutorial_haskell
+  hs-source-dirs:
+      app/Particles
+  default-extensions:
+      BlockArguments
+      ConstraintKinds
+      DataKinds
+      DeriveAnyClass
+      DerivingStrategies
+      DuplicateRecordFields
+      FlexibleContexts
+      FlexibleInstances
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
@@ -156,6 +202,7 @@ test-suite khronos-vulkan-tutorial-haskell-test
       DerivingStrategies
       DuplicateRecordFields
       FlexibleContexts
+      FlexibleInstances
       GeneralizedNewtypeDeriving
       ImportQualifiedPost
       LambdaCase
