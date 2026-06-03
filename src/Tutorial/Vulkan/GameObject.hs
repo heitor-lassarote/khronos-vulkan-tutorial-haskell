@@ -3,10 +3,10 @@ module Tutorial.Vulkan.GameObject
   , modelMatrix
   ) where
 
-import Control.Lens                        ((&), (.~), (^.))
 import Data.Kind                           (Type)
 import Data.Vector                         (Vector)
-import Linear                              qualified as Linear
+import Geomancy                            qualified as Geomancy
+import Geomancy.Transform                  qualified as Geomancy
 import UnliftIO.Foreign                    (Ptr)
 import Vulkan                              qualified as Vk
 
@@ -14,21 +14,19 @@ import Tutorial.Vulkan.UniformBufferObject (UniformBufferObject (..))
 
 type GameObject :: Type
 data GameObject = GameObject
-  { position, rotation, scale :: Linear.V3 Float
+  { position, rotation, scale :: Geomancy.Vec3
   , uniformBuffers            :: Vector Vk.Buffer
   , uniformBuffersMemory      :: Vector Vk.DeviceMemory
   , uniformBuffersMapped      :: Vector (Ptr UniformBufferObject)
   , descriptorSets            :: Vector Vk.DescriptorSet
   }
 
-modelMatrix :: GameObject -> Linear.M44 Float
+modelMatrix :: GameObject -> Geomancy.Transform
 modelMatrix GameObject{position, rotation, scale} =
-  Linear.mkTransformation rotation' position
-  & (Linear.!*! scale')
-  & Linear.transpose
+  Geomancy.translateV position <> rotation' <> Geomancy.withVec3 scale Geomancy.scale3
  where
   rotation' =
-      Linear.axisAngle (Linear.V3 0 1 0) (rotation ^. Linear._y)
-    * Linear.axisAngle (Linear.V3 1 0 0) (rotation ^. Linear._x)
-    * Linear.axisAngle (Linear.V3 0 0 1) (rotation ^. Linear._z)
-  scale' = Linear.scaled (Linear.vector scale & Linear._w .~ 1)
+    Geomancy.withVec3 rotation \x y z ->
+       Geomancy.rotateY y
+    <> Geomancy.rotateX x
+    <> Geomancy.rotateZ z

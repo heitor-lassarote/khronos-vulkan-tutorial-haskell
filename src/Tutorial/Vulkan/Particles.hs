@@ -1,6 +1,6 @@
 module Tutorial.Vulkan.Particles (defaultMain) where
 
-import Control.Lens                 (_1, _3, view, (&), (^.))
+import Control.Lens                 (_1, _3, view, (&))
 import Control.Monad                (when)
 import Control.Monad.IO.Class       (MonadIO, liftIO)
 import Control.Monad.Loops          (whileM_)
@@ -15,8 +15,8 @@ import Data.Vector                  (Vector)
 import Data.Vector                  qualified as Vector
 import Data.Vector.Storable         qualified as SVector
 import Data.Word                    (Word32, Word64)
+import Geomancy                     qualified as Geomancy
 import Graphics.UI.GLFW             qualified as GLFW
-import Linear                       qualified as Linear
 import System.FilePath              ((<.>), (</>))
 import System.Random.Stateful       (StatefulGen)
 import System.Random.Stateful       qualified as Random
@@ -203,8 +203,8 @@ createGraphicsPipeline device descriptorSetLayout swapchainSurfaceFormat = do
 
 type Particle :: Type
 data Particle = Particle
-  { position, velocity :: Linear.V2 Float
-  , color              :: Linear.V4 Float
+  { position, velocity :: Geomancy.Vec2
+  , color              :: Geomancy.Vec4
   }
 
 getBindingDescription :: Vk.VertexInputBindingDescription
@@ -222,25 +222,25 @@ getAttributeDescriptions = Vector.fromList
     }
   , Vk.VertexInputAttributeDescription
     { Vk.location = 1, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32B32A32_SFLOAT
-    , Vk.offset = fromIntegral $ 2 * sizeOf (undefined :: Linear.V2 Float)
+    , Vk.offset = fromIntegral $ 2 * sizeOf (undefined :: Geomancy.Vec2)
     }
   ]
 
 instance Storable Particle where
-  sizeOf _ = 2 * sizeOf (undefined :: Linear.V2 Float) + sizeOf (undefined :: Linear.V4 Float)
+  sizeOf _ = 2 * sizeOf (undefined :: Geomancy.Vec2) + sizeOf (undefined :: Geomancy.Vec4)
 
   alignment _ = alignment (undefined :: Float)
 
   peek ptr = do
     position <- peek (castPtr ptr)
-    velocity <- peekByteOff (castPtr ptr) (sizeOf (undefined :: Linear.V2 Float))
-    color <- peekByteOff (castPtr ptr) (2 * sizeOf (undefined :: Linear.V2 Float))
+    velocity <- peekByteOff (castPtr ptr) (sizeOf (undefined :: Geomancy.Vec2))
+    color <- peekByteOff (castPtr ptr) (2 * sizeOf (undefined :: Geomancy.Vec2))
     pure Particle{..}
 
   poke ptr Particle{..} = do
     poke (castPtr ptr) position
-    pokeByteOff (castPtr ptr) (sizeOf (undefined :: Linear.V2 Float)) velocity
-    pokeByteOff (castPtr ptr) (2 * sizeOf (undefined :: Linear.V2 Float)) color
+    pokeByteOff (castPtr ptr) (sizeOf (undefined :: Geomancy.Vec2)) velocity
+    pokeByteOff (castPtr ptr) (2 * sizeOf (undefined :: Geomancy.Vec2)) color
 
 type UniformBufferObject :: Type
 newtype UniformBufferObject = UniformBufferObject
@@ -259,17 +259,19 @@ createShaderStorageBuffers
   -> m (Vector Vk.Buffer)
 createShaderStorageBuffers physicalDevice device commandPool queue height width random = do
   particles <- SVector.replicateM particleCount do
-    rndR <- Random.uniformRM (0, 1) random
+    rndRadius <- Random.uniformRM (0, 1) random
     theta <- Random.uniformRM (0, 2 * pi) random
     let
-      r = 0.25 * sqrt rndR
+      r = 0.25 * sqrt rndRadius
       x = r * cos theta * fromIntegral height / fromIntegral width
       y = r * sin theta
-    color <- Random.uniformRM (Linear.V3 0 0 0, Linear.V3 1 1 1) random
+    rndR <- Random.uniformRM (0, 1) random
+    rndG <- Random.uniformRM (0, 1) random
+    rndB <- Random.uniformRM (0, 1) random
     pure Particle
-      { position = Linear.V2 x y
-      , velocity = Linear.normalize (Linear.V2 x y) Linear.^* 0.00025
-      , color = Linear.V4 (color ^. Linear._x) (color ^. Linear._y) (color ^. Linear._z) 1
+      { position = Geomancy.vec2 x y
+      , velocity = Geomancy.normalize (Geomancy.vec2 x y) Geomancy.^* 0.00025
+      , color = Geomancy.vec4 rndR rndG rndB 1
       }
   Vector.replicateM maxFramesInFlight do
     fst <$> createBuffer'

@@ -68,6 +68,7 @@ ghc-options:
 - -Wno-implicit-prelude
 - -Wno-missed-specialisations
 - -Wno-missing-import-lists
+- -Wno-missing-local-signatures
 - -Wno-missing-role-annotations
 - -Wno-missing-safe-haskell-mode
 - -Wno-monomorphism-restriction
@@ -80,13 +81,12 @@ library:
   dependencies:
   - bytestring
   - filepath
+  - geomancy
   - GLFW-b
   - gltf-loader
-  - hashable
   - integer-logarithms
   - ktx-codec
   - lens
-  - linear
   - monad-loops
   - mtl
   - random

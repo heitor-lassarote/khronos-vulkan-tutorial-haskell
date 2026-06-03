@@ -41,6 +41,10 @@ packages:
 #   commit: e7b331f14bcffb8367cd58fbfc8b40ec7642100a
 #
 extra-deps:
+- geomancy-0.3.0.1@sha256:3065cb7746b85fbcedc9b5dbcd7222510399217a9e046daed01c9b2998ddc534,2636
+- gl-block-1.0@sha256:4b098e98a8c8b566cb583c6c105eeafe6be80f7f4a0f687f4d8781841acce8e4,1762
+- ptrdiff-0@sha256:0aef162233f5dcf64bd6993e4df4769c31df693e0002c797fb06998df2fae10e,843
+- webcolor-labels-0.1.0.0@sha256:ad776868b81d2908e69b0e4620c307b3b847ea959d46e96b11e04d51efeb2124,1995
 - git: https://gitlab.com/dpwiz/ktx.git
   subdir: ktx-codec
   commit: 6e9408ce2347f70a7c952ffcdbda3dc6d1fba60b

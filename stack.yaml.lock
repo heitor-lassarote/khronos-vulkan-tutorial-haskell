@@ -5,6 +5,34 @@
 
 packages:
 - completed:
+    hackage: geomancy-0.3.0.1@sha256:3065cb7746b85fbcedc9b5dbcd7222510399217a9e046daed01c9b2998ddc534,2636
+    pantry-tree:
+      sha256: 6f1d29aa90ffaea5a0d1acfe38631a988c4d28b0529c5ac33dcb7bf9aa230f2a
+      size: 1954
+  original:
+    hackage: geomancy-0.3.0.1@sha256:3065cb7746b85fbcedc9b5dbcd7222510399217a9e046daed01c9b2998ddc534,2636
+- completed:
+    hackage: gl-block-1.0@sha256:4b098e98a8c8b566cb583c6c105eeafe6be80f7f4a0f687f4d8781841acce8e4,1762
+    pantry-tree:
+      sha256: 61ba9f777adda84168a9cf888b474438d81ca877fdabb4a2473b047ac6719085
+      size: 546
+  original:
+    hackage: gl-block-1.0@sha256:4b098e98a8c8b566cb583c6c105eeafe6be80f7f4a0f687f4d8781841acce8e4,1762
+- completed:
+    hackage: ptrdiff-0@sha256:0aef162233f5dcf64bd6993e4df4769c31df693e0002c797fb06998df2fae10e,843
+    pantry-tree:
+      sha256: 44b24db00ca60d3c64c36720dbbb41ae212c4e587c51ad077395a788e63ff1f9
+      size: 272
+  original:
+    hackage: ptrdiff-0@sha256:0aef162233f5dcf64bd6993e4df4769c31df693e0002c797fb06998df2fae10e,843
+- completed:
+    hackage: webcolor-labels-0.1.0.0@sha256:ad776868b81d2908e69b0e4620c307b3b847ea959d46e96b11e04d51efeb2124,1995
+    pantry-tree:
+      sha256: 7391909f76da1f851c6b90d3637dfa4ea10cd5ac691722e15497d925749b15f1
+      size: 332
+  original:
+    hackage: webcolor-labels-0.1.0.0@sha256:ad776868b81d2908e69b0e4620c307b3b847ea959d46e96b11e04d51efeb2124,1995
+- completed:
     commit: 6e9408ce2347f70a7c952ffcdbda3dc6d1fba60b
     git: https://gitlab.com/dpwiz/ktx.git
     name: ktx-codec

@@ -3,7 +3,7 @@ module Tutorial.Vulkan.HelloTriangle (defaultMain) where
 import Codec.Ktx2                          qualified as Ktx2
 import Codec.Ktx2.Header                   qualified as Ktx2
 import Codec.Ktx2.Read                     qualified as Ktx2
-import Control.Lens                        (view, (&), (+~))
+import Control.Lens                        (_1, _2, _3, view, (^.))
 import Control.Monad                       (unless, when)
 import Control.Monad.IO.Class              (MonadIO, liftIO)
 import Control.Monad.Loops                 (whileM_)
@@ -22,8 +22,10 @@ import Data.Vector                         (Vector)
 import Data.Vector                         qualified as Vector
 import Data.Vector.Storable                qualified as SVector
 import Data.Word                           (Word32)
+import Geomancy                            qualified as Geomancy
+import Geomancy.Vulkan.Projection          qualified as Geomancy
+import Geomancy.Vulkan.View                qualified as Geomancy
 import Graphics.UI.GLFW                    qualified as GLFW
-import Linear                              qualified as Linear
 import Math.NumberTheory.Logarithms        (integerLog2)
 import System.FilePath                     ((<.>), (</>))
 import Text.GLTF.Loader                    qualified as GLTF
@@ -39,9 +41,31 @@ import Vulkan.Zero                         (zero)
 import Tutorial.Vulkan.Common
 import Tutorial.Vulkan.GameObject          (GameObject (..), modelMatrix)
 import Tutorial.Vulkan.UniformBufferObject (UniformBufferObject (..))
-import Tutorial.Vulkan.Utils               (findM, perspectiveVulkan)
+import Tutorial.Vulkan.Utils               (findM)
 import Tutorial.Vulkan.Vertex              (Index (..), Vertex (..))
 import Tutorial.Vulkan.Vertex              qualified as Vertex
+
+{-
+Note [Geomancy perspective depth]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Geomancy inverts the stencil depth to test for 0 rather than 1.
+Because of this, we diverge from the tutorial in a couple of places:
+
+  1. Use COMPARE_OP_GREATER rather than COMPARE_OP_LESS.
+  2. Set the depth clear value to 0 and not 1.
+  3. Remove the far plane distance in the projection matrix.
+
+This is done to improve the precision of the depth value,
+as IEEE floating point numbers have better precision near 0 than 1.
+
+This also allows to remove the fictional far plane (located at 1, meaning infinity),
+hence only the value of the near plane is current passed, and the value of the far plane was removed.
+
+For more information, see:
+
+  * https://hackage-content.haskell.org/package/geomancy-0.3.0.1/docs/Geomancy-Vulkan-Projection.html#v:reverseDepthRH
+  * https://iolite-engine.com/blog_posts/reverse_z_cheatsheet
+-}
 
 type HelloTriangle :: Type
 data HelloTriangle
@@ -289,7 +313,7 @@ createGraphicsPipeline physicalDevice device descriptorSetLayout swapchainSurfac
     depthStencil = (zero :: Vk.PipelineDepthStencilStateCreateInfo)
       { Vk.depthTestEnable = True
       , Vk.depthWriteEnable = True
-      , Vk.depthCompareOp = Vk.COMPARE_OP_LESS
+      , Vk.depthCompareOp = Vk.COMPARE_OP_GREATER -- See Note [Geomancy perspective depth]
       , Vk.depthBoundsTestEnable = False
       , Vk.stencilTestEnable = False
       }
@@ -675,9 +699,10 @@ processGltf GLTF.Gltf{..} =
           let
             baseVertex = fromIntegral $ Vector.length vs
             -- glTF uses a right-handed coordinate system with Y-up, while Vulkan has Y-down.
-            vertices = Vector.map
-              (\(pos, texCoord) -> Vertex{pos, color, texCoord})
-              (Vector.zip meshPrimitivePositions meshPrimitiveTexCoords)
+            vertices = Vector.zipWith
+              (\(v3ToVec3 -> pos) (v2ToVec2 -> texCoord) -> Vertex{..})
+              meshPrimitivePositions
+              meshPrimitiveTexCoords
             indices = Vector.map
               (\index -> fromIntegral index + baseVertex)
               meshPrimitiveIndices
@@ -690,7 +715,9 @@ processGltf GLTF.Gltf{..} =
   in
   (SVector.fromList $ Vector.toList vertices', SVector.fromList $ Vector.toList indices')
  where
-  color = Linear.V3 1 1 1
+  color = Geomancy.vec3 1 1 1
+  v2ToVec2 v2 = Geomancy.vec2 (v2 ^. _1) (v2 ^. _2)
+  v3ToVec3 v3 = Geomancy.vec3 (v3 ^. _1) (v3 ^. _2) (v3 ^. _3)
 
 -- | Creates 3 game objects.
 setupGameObjects
@@ -708,11 +735,11 @@ setupGameObjects physicalDevice device descriptorPool descriptorSetLayout textur
  where
   transforms = Vector.fromList
     [ -- Center
-      (Linear.V3 0 0 0, Linear.V3 0 0 0, Linear.V3 1 1 1)
+      (Geomancy.vec3 0 0 0, Geomancy.vec3 0 (pi / -2) 0, Geomancy.vec3 1 1 1)
     , -- Left
-      (Linear.V3 -2 0 -1, Linear.V3 0 (pi / 4) 0, Linear.V3 0.75 0.75 0.75)
+      (Geomancy.vec3 -2 0 -1, Geomancy.vec3 0 (pi / -4) 0, Geomancy.vec3 0.75 0.75 0.75)
     , -- Right
-      (Linear.V3 2 0 -1, Linear.V3 0 (pi / -4) 0, Linear.V3 0.75 0.75 0.75)
+      (Geomancy.vec3 2 0 -1, Geomancy.vec3 0 (pi / 4) 0, Geomancy.vec3 0.75 0.75 0.75)
     ]
 
 -- | Creates a vertex buffer for the input.
@@ -953,7 +980,7 @@ recordCommandBuffer imageIndex frame = do
 
   let
     clearColor = Vk.Color $ Vk.Float32 0 0 0 1
-    clearDepth = Vk.DepthStencil $ Vk.ClearDepthStencilValue 1 0
+    clearDepth = Vk.DepthStencil $ Vk.ClearDepthStencilValue 0 0 -- See Note [Geomancy perspective depth]
     renderArea = Vk.Rect2D {Vk.offset = Vk.Offset2D 0 0, Vk.extent = swapchain.extent}
 
   case swapchain.extra.renderPassM of
@@ -1118,7 +1145,7 @@ drawFrame frameIndex = do
 
 -- | Computes the MVP matrices for each game object and writes the result into the object's 'uniformBufferMapped'.
 --
--- The models are rotated around the Y axis at 0.1 radians per second.
+-- The models are rotated around the Y axis at 0.5 radians per second.
 --
 -- The camera is located at (2, 2, 6), and looks towards the origin.
 --
@@ -1131,20 +1158,17 @@ updateUniformBuffers frame = do
   swapchain <- readIORef swapchainRef
   let
     time = realToFrac $ Time.diffUTCTime currentTime startTime
-    -- Need to transpose the matrices to column-major.
-    initialRotation =
-      Linear.transpose $ Linear.m33_to_m44 $ Linear.fromQuaternion $ Linear.axisAngle (Linear.V3 1 0 0) (pi / 2)
-    view' = Linear.transpose $ Linear.lookAt (Linear.V3 2 2 6) (Linear.V3 0 0 0) (Linear.V3 0 0 1)
-    proj = Linear.transpose $ perspectiveVulkan
+    -- See Note [Geomancy perspective depth]
+    view' = Geomancy.lookAtRH (Geomancy.vec3 2 2 6) (Geomancy.vec3 0 0 0) (Geomancy.vec3 0 1 0)
+    proj = Geomancy.reverseDepthRH
       (pi / 4)
-      (realToFrac swapchain.extent.width / realToFrac swapchain.extent.height)
       0.1
-      20
+      (realToFrac swapchain.extent.width)
+      (realToFrac swapchain.extent.height)
   for_ gameObjects \gameObject -> do
     let
-      rotationY = gameObject.rotation & Linear._y +~ 0.1 * time
-      continuousRotation = modelMatrix gameObject{rotation = rotationY}
-      model = continuousRotation Linear.!*! initialRotation
+      rotationY = Geomancy.withVec3 gameObject.rotation \x y z -> Geomancy.vec3 x (y + 0.5 * time) z
+      model = modelMatrix gameObject{rotation = rotationY}
       ubo = UniformBufferObject{view = view', ..}
     liftIO $ poke (gameObject.uniformBuffersMapped Vector.! fromIntegral frame.extra.frameIndex) ubo
 

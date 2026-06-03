@@ -6,26 +6,20 @@ module Tutorial.Vulkan.Vertex
   , getAttributeDescriptions
   ) where
 
-import Data.Hashable    (Hashable (..))
 import Data.Kind        (Type)
 import Data.Vector      (Vector)
 import Data.Vector      qualified as Vector
 import Data.Word        (Word32)
-import Linear           qualified as Linear
+import Geomancy         qualified as Geomancy
 import UnliftIO.Foreign (Storable (..), castPtr)
 import Vulkan           qualified as Vk
 
 type Vertex :: Type
 data Vertex = Vertex
-  { pos      :: Linear.V3 Float
-  , color    :: Linear.V3 Float
-  , texCoord :: Linear.V2 Float
+  { pos      :: Geomancy.Vec3
+  , color    :: Geomancy.Vec3
+  , texCoord :: Geomancy.Vec2
   }
-  deriving stock (Eq)
-
-instance Hashable Vertex where
-  hashWithSalt salt Vertex{..} =
-    salt `hashWithSalt` pos `hashWithSalt` color `hashWithSalt` texCoord
 
 type Index :: Type
 newtype Index = Index{index :: Word32}
@@ -36,22 +30,22 @@ indexType = Vk.INDEX_TYPE_UINT32
 
 instance Storable Vertex where
   sizeOf _ =
-    2 * sizeOf (undefined :: Linear.V3 Float) + sizeOf (undefined :: Linear.V2 Float)
+    2 * sizeOf (undefined :: Geomancy.Vec3) + sizeOf (undefined :: Geomancy.Vec2)
 
   alignment _ = alignment (undefined :: Float)
 
   peek ptr = do
     let p = castPtr ptr
     pos <- peek p
-    color <- peekByteOff p (sizeOf (undefined :: Linear.V3 Float))
-    texCoord <- peekByteOff p (2 * sizeOf (undefined :: Linear.V3 Float))
+    color <- peekByteOff p (sizeOf (undefined :: Geomancy.Vec3))
+    texCoord <- peekByteOff p (2 * sizeOf (undefined :: Geomancy.Vec3))
     pure Vertex{..}
 
   poke ptr Vertex{..} = do
     let p = castPtr ptr
     poke p pos
-    pokeByteOff p (sizeOf (undefined :: Linear.V3 Float)) color
-    pokeByteOff p (2 * sizeOf (undefined :: Linear.V3 Float)) texCoord
+    pokeByteOff p (sizeOf (undefined :: Geomancy.Vec3)) color
+    pokeByteOff p (2 * sizeOf (undefined :: Geomancy.Vec3)) texCoord
 
 getBindingDescription :: Vk.VertexInputBindingDescription
 getBindingDescription = Vk.VertexInputBindingDescription
@@ -68,10 +62,10 @@ getAttributeDescriptions = Vector.fromList
     }
   , Vk.VertexInputAttributeDescription
     { Vk.location = 1, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32B32_SFLOAT
-    , Vk.offset = fromIntegral $ sizeOf (undefined :: Linear.V3 Float)
+    , Vk.offset = fromIntegral $ sizeOf (undefined :: Geomancy.Vec3)
     }
   , Vk.VertexInputAttributeDescription
     { Vk.location = 2, Vk.binding = 0, Vk.format = Vk.FORMAT_R32G32_SFLOAT
-    , Vk.offset = fromIntegral $ 2 * sizeOf (undefined :: Linear.V3 Float)
+    , Vk.offset = fromIntegral $ 2 * sizeOf (undefined :: Geomancy.Vec3)
     }
   ]
